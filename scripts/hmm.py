@@ -1,348 +1,340 @@
 #!/usr/bin/env python3
 """
-Kunitz-type Protease Inhibitor Domain - HMM Profile Pipeline (Biopython version)
-Compatible with hmmologs project standards.
-Includes independent positive and negative validation.
+Main pipeline script for building, validating, and applying a
+structure-informed Profile Hidden Markov Model (HMM) for the Kunitz domain.
 """
-import matplotlib.pyplot as plt
+
 import os
 import sys
 import subprocess
-from pathlib import Path
-from typing import Dict, Set, Tuple
-import yaml
-from datetime import datetime
-from Bio import SeqIO
+import gzip
 import json
-sys.path.append(os.path.dirname(__file__))
+from pathlib import Path
+from datetime import datetime
+import yaml
+from Bio import AlignIO, SeqIO
+from Bio.SeqRecord import SeqRecord
+from Bio.Seq import Seq
+import matplotlib.pyplot as plt # Import matplotlib for plotting
 
+# --- Helper Functions ---
 
-# Import plotting functions from the local module
-from visualize_metrics import plot_confusion_bar, plot_metrics_summary
+def load_config(config_file: Path = None) -> dict:
+    """Loads configuration from a YAML file."""
+    if config_file is None:
+        # Assume config.yaml is in a 'config' directory one level up from 'scripts'
+        script_dir = Path(__file__).resolve().parent
+        project_root_guess = script_dir.parent
+        config_file = project_root_guess / "config" / "config.yaml"
 
-# ---------- Biopython-based utilities and Checks ----------
+    print(f"DEBUG: script_dir (parent of hmm.py): {script_dir}")
+    print(f"DEBUG: project_root_guess: {project_root_guess}")
+    print(f"DEBUG: config_path that script is looking for: {config_file}")
+    print(f"DEBUG: config_path.exists() returned {config_file.exists()}: {config_file}")
 
-def check_stockholm(path: Path) -> bool:
-    """Checks if a file is a valid Stockholm format."""
-    if not path.exists() or path.stat().st_size == 0:
-        print(f"ERROR: {path} is missing or empty.", file=sys.stderr)
-        return False
-    try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            next(SeqIO.parse(f, "stockholm"))
-        return True
-    except Exception:
-        print(f"ERROR: {path} is not a valid Stockholm file or has parsing issues.", file=sys.stderr)
-        return False
-
-def check_fasta(path: Path) -> bool:
-    """Checks if a file is a valid FASTA format."""
-    if not path.exists() or path.stat().st_size == 0:
-        print(f"ERROR: {path} is missing or empty.", file=sys.stderr)
-        return False
-    try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            next(SeqIO.parse(f, "fasta"))
-        return True
-    except Exception:
-        print(f"ERROR: {path} is not a valid FASTA file.", file=sys.stderr)
-        sys.exit(1) # Exit if essential FASTA is malformed
-        return False
-
-def check_label_txt(path: Path) -> bool:
-    """Checks if a label text file exists and has the correct format."""
-    if not path.exists() or path.stat().st_size == 0:
-        print(f"ERROR: {path} is missing or empty.", file=sys.stderr)
-        return False
-    try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                line = line.strip()
-                if line and len(line.split('\t')) != 2: # Expecting "ID\tLABEL"
-                    print(f"ERROR: {path} has a line with wrong format: '{line}' (expected ID\\tLABEL)", file=sys.stderr)
-                    return False
-        return True
-    except Exception as e:
-        print(f"ERROR: Error reading label file {path}: {e}", file=sys.stderr)
-        sys.exit(1)
-        return False
-
-# ---------- Config loading & output dir creation ----------
-
-def find_config() -> Path:
-    """Finds the config.yaml file relative to the script's location."""
-    script_dir = Path(__file__).parent # This is 'scripts/'
-    config_path = script_dir.parent / "config" / "config.yaml"
-    if config_path.exists():
-        return config_path.resolve()
-        
-    raise FileNotFoundError("config.yaml not found! Ensure it's in 'config/' relative to the project root.")
-
-def load_config() -> Dict:
-    """Loads and validates configuration from config.yaml."""
-    try:
-        config_file = find_config()
-    except FileNotFoundError as e:
-        print(f"Configuration error: {e}", file=sys.stderr)
+    if not config_file.exists():
+        print(f"ERROR: Config file not found at {config_file}", file=sys.stderr)
         sys.exit(1)
 
+    # IMPORTANT: 'output_dir' is NOT in config.yaml directly. It's derived from 'results_dir'.
+    # So, 'results_dir' should be in required_fields, not 'output_dir'.
     required_fields = {
-        'output_dir': str,
+        'data_dir': str,
+        'results_dir': str, # Corrected: Expect results_dir, not output_dir
+        'scripts_dir': str,
+        'config_dir': str,
         'seed_alignment': str,
         'positive_validation_fasta': str,
-        'non_kunitz_validation_fasta': str, # NEW: This is now required
+        'non_kunitz_validation_fasta': str,
         'validation_labels_txt': str,
         'swissprot_fasta': str,
         'e_value_cutoff': float,
+        'negative_set_strategy': str,
+        'clustering_identity_threshold': float, # Added for consistency
+        'clustering_length_difference_cutoff': float, # Added for consistency
     }
+
     try:
         with open(config_file, 'r') as f:
             config = yaml.safe_load(f)
-        for field, field_type in required_fields.items():
-            if field not in config:
-                raise ValueError(f"Missing required config field: {field}")
-            if not isinstance(config[field], field_type):
-                if field_type == float and isinstance(config[field], int):
-                    config[field] = float(config[field])
-                else:
-                    raise ValueError(f"Invalid type for {field}, expected {field_type.__name__} but got {type(config[field]).__name__}")
 
-        # Resolve all paths relative to the project root (assuming script in 'scripts/')
-        project_root = Path(__file__).resolve().parent.parent
-        for key in ['seed_alignment', 'positive_validation_fasta', 'non_kunitz_validation_fasta',
-                    'validation_labels_txt', 'swissprot_fasta']:
-            config[key] = project_root / Path(config[key])
-        
-        # Create unique run output directory
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_output_dir = project_root / Path(config['output_dir'])
-        output_dir = base_output_dir / f"run_{run_id}"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        config['output_dir'] = output_dir
+        # Validate required fields
+        for field, expected_type in required_fields.items():
+            if field not in config or not isinstance(config[field], expected_type):
+                print(f"Configuration error in {config_file}: Missing or invalid required config field: {field}. Expected type: {expected_type.__name__}", file=sys.stderr)
+                sys.exit(1)
 
-        print(f"Configuration loaded. Results will be saved to: {output_dir}")
+        # Convert path strings to Path objects for easier handling
+        config['data_dir'] = Path(config['data_dir'])
+        config['results_dir'] = Path(config['results_dir'])
+        config['scripts_dir'] = Path(config['scripts_dir'])
+        config['config_dir'] = Path(config['config_dir'])
+        config['seed_alignment'] = Path(config['seed_alignment'])
+        config['positive_validation_fasta'] = Path(config['positive_validation_fasta'])
+        config['non_kunitz_validation_fasta'] = Path(config['non_kunitz_validation_fasta'])
+        config['validation_labels_txt'] = Path(config['validation_labels_txt'])
+        config['swissprot_fasta'] = Path(config['swissprot_fasta'])
+
+        # Validate strategy-specific fields (copied from data_prep.py for consistency)
+        if config['negative_set_strategy'] == 'random_swissprot':
+            if 'num_negative_samples' not in config or not isinstance(config['num_negative_samples'], int):
+                print("ERROR: 'num_negative_samples' missing or invalid for 'random_swissprot' strategy.", file=sys.stderr)
+                sys.exit(1)
+        elif config['negative_set_strategy'] == 'structurally_similar':
+            if 'structurally_similar_negative_pdb_ids' not in config or not isinstance(config['structurally_similar_negative_pdb_ids'], list):
+                print("ERROR: 'structurally_similar_negative_pdb_ids' missing or invalid for 'structurally_similar' strategy.", file=sys.stderr)
+                sys.exit(1)
+            if 'structurally_similar_negative_pdb_chains' not in config or not isinstance(config['structurally_similar_negative_pdb_chains'], dict):
+                print("ERROR: 'structurally_similar_negative_pdb_chains' missing or invalid for 'structurally_similar' strategy.", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(f"ERROR: Unknown negative_set_strategy: {config['negative_set_strategy']}", file=sys.stderr)
+            sys.exit(1)
+
         return config
+
+    except yaml.YAMLError as e:
+        print(f"ERROR: Error parsing config.yaml: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def get_full_path(relative_path: Path, project_root: Path) -> Path:
+    """Converts a relative Path object to an absolute Path relative to project root."""
+    return project_root / relative_path
+
+def run_hmmbuild(seed_alignment_file: Path, output_hmm_file: Path) -> None:
+    """Builds an HMM from a Stockholm alignment file."""
+    print(f"Building HMM: hmmbuild {output_hmm_file} {seed_alignment_file}")
+    cmd = ["hmmbuild", str(output_hmm_file), str(seed_alignment_file)]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print("HMM built successfully.")
+    except FileNotFoundError:
+        print("ERROR: hmmbuild command not found. Please install HMMER or ensure it's in your PATH.", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: hmmbuild failed: {e.stderr}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        print(f"Configuration error in {config_file}: {e}", file=sys.stderr)
+        print(f"An unexpected error occurred during hmmbuild: {e}", file=sys.stderr)
         sys.exit(1)
 
-# ---------- HMM and metrics functions ----------
-
-def run_hmmbuild(seed_alignment: Path, hmm_file: Path):
-    """Trains a Profile HMM using HMMER's hmmbuild."""
-    cmd = ["hmmbuild", str(hmm_file), str(seed_alignment)]
-    print(f"Building HMM: {' '.join(cmd)}")
+def run_hmmsearch(hmm_file: Path, fasta_file: Path, output_dir: Path, tag: str, e_value: float) -> Path:
+    """Runs hmmsearch against a FASTA file."""
+    tblout_file = output_dir / f"hmmsearch_{tag}.tbl"
+    print(f"Running hmmsearch: hmmsearch --tblout {tblout_file} -E {e_value} {hmm_file} {fasta_file}")
+    cmd = ["hmmsearch", "--tblout", str(tblout_file), "-E", str(e_value), str(hmm_file), str(fasta_file)]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"HMM built successfully: {hmm_file}")
+        print(f"hmmsearch for '{tag}' completed successfully.")
+        return tblout_file
     except FileNotFoundError:
-        print("ERROR: hmmbuild command not found. Please ensure HMMER is installed and in your PATH.", file=sys.stderr)
+        print("ERROR: hmmsearch command not found. Please install HMMER or ensure it's in your PATH.", file=sys.stderr)
         sys.exit(1)
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: hmmbuild failed. Stderr:\n{e.stderr}", file=sys.stderr)
+        print(f"ERROR: hmmsearch failed for '{tag}': {e.stderr}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"An unexpected error occurred during hmmsearch for '{tag}': {e}", file=sys.stderr)
         sys.exit(1)
 
-def run_hmmsearch(hmm_file: Path, fasta_file: Path, output_dir: Path, tag: str = "search", e_value: float = 1e-5) -> Path:
-    """Runs hmmsearch and returns the path to the .tblout file."""
-    tblout = output_dir / f"hmmsearch_{tag}.tbl"
-    cmd = [
-        "hmmsearch",
-        "--tblout", str(tblout),
-        "-E", str(e_value),
-        "--noali",
-        str(hmm_file), str(fasta_file)
-    ]
-    print(f"Running hmmsearch on {fasta_file.name}: {' '.join(cmd)}")
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"hmmsearch results saved to {tblout}")
-        return tblout
-    except FileNotFoundError:
-        print("ERROR: hmmsearch command not found. Please ensure HMMER is installed and in your PATH.", file=sys.stderr)
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: hmmsearch failed on {fasta_file.name}. Stderr:\n{e.stderr}", file=sys.stderr)
-        sys.exit(1)
-
-def parse_tblout(tbl_file: Path, e_value_cutoff: float) -> Set[str]:
-    """Parses hmmsearch --tblout and returns a set of unique hit IDs passing the E-value cutoff."""
+def parse_tblout(tblout_file: Path, e_value_cutoff: float) -> set:
+    """Parses hmmsearch --tblout file and returns a set of hit sequence IDs."""
     hits = set()
-    if not tbl_file.exists() or tbl_file.stat().st_size == 0:
-        print(f"WARNING: tblout file {tbl_file} is missing or empty. No hits parsed.", file=sys.stderr)
-        return hits
     try:
-        with open(tbl_file, 'r', encoding='utf-8', errors='ignore') as f:
+        with open(tblout_file, 'r') as f:
             for line in f:
-                if line.startswith("#"):
+                if line.startswith('#'):
                     continue
                 parts = line.split()
-                if len(parts) >= 13:
-                    try:
-                        target_name = parts[0]
-                        e_value = float(parts[4])
-                        if e_value < e_value_cutoff:
-                            hits.add(target_name)
-                    except ValueError:
-                        continue # Skip lines where E-value isn't a float
-        return hits
-    except Exception as e:
-        print(f"ERROR: Error parsing tblout file {tbl_file}: {e}", file=sys.stderr)
+                if len(parts) > 4: # Ensure enough columns for parsing
+                    seq_id = parts[0]
+                    e_value = float(parts[4])
+                    if e_value <= e_value_cutoff:
+                        hits.add(seq_id)
+    except FileNotFoundError:
+        print(f"ERROR: tblout file '{tblout_file}' not found.", file=sys.stderr)
         sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Failed to parse tblout file '{tblout_file}': {e}", file=sys.stderr)
+        sys.exit(1)
+    return hits
 
-def load_labels(label_file: Path) -> Dict[str, str]:
-    """Loads sequence ID -> label mapping from a label file."""
+def load_labels(label_file: Path) -> dict:
+    """Loads true labels from a text file (ID TAB Label)."""
     labels = {}
-    if not label_file.exists() or label_file.stat().st_size == 0:
-        print(f"WARNING: Label file {label_file} is missing or empty. No labels loaded.", file=sys.stderr)
-        return labels
     try:
-        with open(label_file, 'r', encoding='utf-8', errors='ignore') as f:
+        with open(label_file, 'r') as f:
             for line in f:
                 line = line.strip()
-                if line and not line.startswith("#"):
-                    parts = line.split('\t')
-                    if len(parts) == 2:
-                        labels[parts[0]] = parts[1]
-                    else:
-                        print(f"WARNING: Skipping malformed line in {label_file}: '{line}' (expected ID\\tLABEL)", file=sys.stderr)
-        return labels
-    except Exception as e:
-        print(f"ERROR: Error loading labels from {label_file}: {e}", file=sys.stderr)
+                if not line: continue
+                parts = line.split('\t')
+                if len(parts) == 2:
+                    labels[parts[0]] = parts[1]
+                else:
+                    print(f"WARNING: Skipping malformed label line: '{line}' in {label_file}", file=sys.stderr)
+    except FileNotFoundError:
+        print(f"ERROR: Label file '{label_file}' not found.", file=sys.stderr)
         sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Failed to load labels from '{label_file}': {e}", file=sys.stderr)
+        sys.exit(1)
+    return labels
 
-def evaluate_performance(predicted_hits: Set[str], all_true_labels: Dict[str, str]) -> Dict:
+def evaluate_performance(predicted_hits: set, true_labels: dict) -> dict:
     """
-    Evaluates classification performance given predicted hits and true labels.
-    Assumes '1' for positive, '0' for negative.
+    Evaluates classification performance based on predicted hits and true labels.
+    Returns a dictionary of metrics.
     """
-    tp = 0
-    fp = 0
-    fn = 0
-    tn = 0
+    tp = 0 # True Positives: Actual Kunitz, Predicted Kunitz
+    fp = 0 # False Positives: Actual Non-Kunitz, Predicted Kunitz
+    fn = 0 # False Negatives: Actual Kunitz, Predicted Non-Kunitz
+    tn = 0 # True Negatives: Actual Non-Kunitz, Predicted Non-Kunitz
 
-    for seq_id, true_label in all_true_labels.items():
-        is_predicted = seq_id in predicted_hits
-        is_positive = (true_label == "1")
+    all_validation_ids = set(true_labels.keys())
 
-        if is_predicted and is_positive:
+    for seq_id in all_validation_ids:
+        is_true_positive = (true_labels.get(seq_id) == "1")
+        is_predicted_positive = (seq_id in predicted_hits)
+
+        if is_true_positive and is_predicted_positive:
             tp += 1
-        elif is_predicted and not is_positive:
+        elif not is_true_positive and is_predicted_positive:
             fp += 1
-        elif not is_predicted and is_positive:
-            tn += 1 # A true negative: correctly not predicted and is truly negative
-        elif not is_predicted and is_positive: # This condition should logically be: not is_predicted and is_positive
-            fn += 1 # A false negative: not predicted but is truly positive
-        
-    # Recalculate tn to avoid double counting or logical errors
-    tn = len(all_true_labels) - tp - fp - fn
+        elif is_true_positive and not is_predicted_positive:
+            fn += 1
+        elif not is_true_positive and not is_predicted_positive:
+            tn += 1
 
-    total = tp + tn + fp + fn
-    acc = (tp + tn) / total if total > 0 else 0
-    prec = tp / (tp + fp) if (tp + fp) > 0 else 0
-    rec = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    total_samples = tp + fp + fn + tn
 
-    return dict(TP=tp, FP=fp, FN=fn, TN=tn, accuracy=acc, precision=prec, recall=rec, f1=f1, specificity=specificity)
+    accuracy = (tp + tn) / total_samples if total_samples > 0 else 0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0 # Specificity: True Neg Rate
+
+    metrics = {
+        "TP": tp,
+        "FP": fp,
+        "FN": fn,
+        "TN": tn,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "specificity": specificity
+    }
+    return metrics
+
+def run_hmmlogo(hmm_file: Path, output_dir: Path) -> None:
+    """Generates an HMM logo from the HMM file."""
+    logo_output_path = output_dir / "hmm_logo.png"
+    print(f"Generating HMM logo: hmmlogo -o {logo_output_path} {hmm_file}")
+    cmd = ["hmmlogo", "-o", str(logo_output_path), str(hmm_file)]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print(f"HMM logo saved to {logo_output_path}")
+    except FileNotFoundError:
+        print("ERROR: hmmlogo command not found. Please install HMMER (which includes hmmlogo) or ensure it's in your PATH.", file=sys.stderr)
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: hmmlogo failed: {e.stderr}", file=sys.stderr)
+    except Exception as e:
+        print(f"An unexpected error occurred during hmmlogo generation: {e}", file=sys.stderr)
+
+# --- Plotting Functions ---
 def plot_confusion_bar(metrics, output_path):
     """Plot confusion matrix as a bar chart."""
     labels = ['TP', 'FP', 'FN', 'TN']
-    # Ensure values are integers for the bar chart
-    values = [int(metrics['TP']), int(metrics['FP']), int(metrics['FN']), int(metrics['TN'])]
+    values = [metrics['TP'], metrics['FP'], metrics['FN'], metrics['TN']]
     plt.figure(figsize=(6,4))
     bars = plt.bar(labels, values, color=['green', 'red', 'orange', 'blue'])
-    plt.title("Confusion Matrix Counts") # Changed title to reflect counts
+    plt.title("Confusion Matrix Counts")
     plt.ylabel("Count")
     plt.xlabel("Prediction Outcome")
     for bar in bars:
         yval = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2, yval + 0.1, int(yval), ha='center', va='bottom') # Centered text
+        plt.text(bar.get_x() + bar.get_width()/2, yval + 0.1, int(yval), ha='center', va='bottom')
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
 
 def plot_metrics_summary(metrics, output_path):
-    """Plot precision, recall, accuracy, F1 as a bar chart."""
-    labels = ['Accuracy', 'Precision', 'Recall', 'F1']
-    values = [metrics['accuracy'], metrics['precision'], metrics['recall'], metrics['f1']]
-    plt.figure(figsize=(6,4))
-    bars = plt.bar(labels, values, color=['skyblue', 'lightgreen', 'gold', 'violet'])
-    plt.ylim(0,1.05) # Slightly extend y-limit for text
+    """Plot precision, recall, accuracy, F1, specificity as a bar chart."""
+    labels = ['Accuracy', 'Precision', 'Recall', 'F1', 'Specificity']
+    values = [metrics['accuracy'], metrics['precision'], metrics['recall'], metrics['f1'], metrics['specificity']]
+    plt.figure(figsize=(8,4)) # Slightly wider to accommodate Specificity
+    bars = plt.bar(labels, values, color=['skyblue', 'lightgreen', 'gold', 'violet', 'lightcoral']) # Added color for specificity
+    plt.ylim(0,1.05)
     plt.title("Performance Metrics")
     plt.ylabel("Score")
     for bar in bars:
         yval = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2, yval + 0.02, f"{yval:.2f}", ha='center', va='bottom') # Centered text
+        plt.text(bar.get_x() + bar.get_width()/2, yval + 0.02, f"{yval:.2f}", ha='center', va='bottom')
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
-    
-def run_hmmlogo(hmm_file: Path, output_dir: Path):
-    """Generates an HMM logo using hmmlogo."""
-    logo_file = output_dir / "hmm_logo.png"
-    cmd = ["hmmlogo", "-o", str(logo_file), str(hmm_file)]
-    print(f"Generating HMM logo: {' '.join(cmd)}")
-    try:
-        # hmmlogo prints to stderr by default, capture for cleaner output
-        result = subprocess.run(cmd, check=True, capture_output=True)
-        if logo_file.exists() and logo_file.stat().st_size > 0:
-            print(f"HMM logo saved to {logo_file}")
-        else:
-            print(f"WARNING: hmmlogo ran but {logo_file} was not created or is empty. Stderr:\n{result.stderr.decode()}", file=sys.stderr)
-    except FileNotFoundError:
-        print("ERROR: hmmlogo command not found. Please install HMMER's easel tools or ensure it's in your PATH.", file=sys.stderr)
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: Failed to generate HMM logo. Stderr:\n{e.stderr.decode()}", file=sys.stderr)
 
 
 # ---------- Main pipeline ----------
 
 if __name__ == "__main__":
-    CONFIG = load_config()
+    # Get project root from script location
+    script_dir = Path(__file__).resolve().parent
+    project_root = script_dir.parent
+
+    # Load configuration
+    CONFIG = load_config(project_root / "config" / "config.yaml")
 
     # --- Paths from config ---
-    sto_file = CONFIG["seed_alignment"]
-    validation_pos_fasta = CONFIG["positive_validation_fasta"]
-    validation_neg_fasta = CONFIG["non_kunitz_validation_fasta"] # Updated key
-    validation_labels_txt = CONFIG["validation_labels_txt"]
-    swissprot_fasta = CONFIG["swissprot_fasta"]
-    output_dir = CONFIG["output_dir"]
-    e_value_cutoff = CONFIG["e_value_cutoff"]
+    # Use get_full_path to ensure all paths are absolute
+    DATA_DIR = get_full_path(CONFIG["data_dir"], project_root)
+    RESULTS_BASE_DIR = get_full_path(CONFIG["results_dir"], project_root) # Base results dir
+    SEED_ALIGNMENT_FILE = get_full_path(CONFIG["seed_alignment"], project_root)
+    POSITIVE_VALIDATION_FASTA = get_full_path(CONFIG["positive_validation_fasta"], project_root)
+    NON_KUNITZ_VALIDATION_FASTA = get_full_path(CONFIG["non_kunitz_validation_fasta"], project_root)
+    VALIDATION_LABELS_TXT = get_full_path(CONFIG["validation_labels_txt"], project_root)
+    SWISSPROT_FASTA = get_full_path(CONFIG["swissprot_fasta"], project_root)
+    E_VALUE_CUTOFF = CONFIG["e_value_cutoff"]
+
+    # Create a unique output directory for this run
+    run_output_dir = RESULTS_BASE_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(run_output_dir, exist_ok=True)
+    print(f"Configuration loaded. Results will be saved to: {run_output_dir}")
 
     print("\n--- 1. Data File Checks ---")
     all_ok = True
-    if not check_stockholm(sto_file): all_ok = False
-    if not check_fasta(validation_pos_fasta): all_ok = False
-    if not check_fasta(validation_neg_fasta): all_ok = False # Now this file is auto-generated
-    if not check_label_txt(validation_labels_txt): all_ok = False
+    if not check_stockholm(SEED_ALIGNMENT_FILE): all_ok = False
+    if not check_fasta(POSITIVE_VALIDATION_FASTA): all_ok = False
+    if not check_fasta(NON_KUNITZ_VALIDATION_FASTA): all_ok = False
+    if not check_label_txt(VALIDATION_LABELS_TXT): all_ok = False
     
     # Swissprot fasta can be checked for existence, but not critical for validation steps
-    if not swissprot_fasta.exists():
-        print(f"WARNING: SwissProt FASTA file '{swissprot_fasta}' not found. Full SwissProt scan will be skipped.", file=sys.stderr)
+    if not SWISSPROT_FASTA.exists():
+        print(f"WARNING: SwissProt FASTA file '{SWISSPROT_FASTA}' not found. Full SwissProt scan will be skipped.", file=sys.stderr)
 
     if not all_ok:
         print("\nERROR: Some required input files for validation are missing or invalid. Please ensure you've run 'data_prep.py' and checked manual files (like non_kunitz_proteins.fasta if it was manual).", file=sys.stderr)
         sys.exit(1)
 
     print("\n--- 2. Building HMM ---")
-    hmm_file = output_dir / "kunitz.hmm"
-    run_hmmbuild(sto_file, hmm_file)
+    hmm_file = run_output_dir / "kunitz.hmm"
+    run_hmmbuild(SEED_ALIGNMENT_FILE, hmm_file)
 
     print("\n--- 3. Running HMMER Search on Validation Sets ---")
     # Search against positive validation set
-    val_pos_tbl = run_hmmsearch(hmm_file, validation_pos_fasta, output_dir, tag="validation_pos", e_value=e_value_cutoff)
+    val_pos_tbl = run_hmmsearch(hmm_file, POSITIVE_VALIDATION_FASTA, run_output_dir, tag="validation_pos", e_value=E_VALUE_CUTOFF)
     # Search against negative validation set
-    val_neg_tbl = run_hmmsearch(hmm_file, validation_neg_fasta, output_dir, tag="validation_neg", e_value=e_value_cutoff)
+    val_neg_tbl = run_hmmsearch(hmm_file, NON_KUNITZ_VALIDATION_FASTA, run_output_dir, tag="validation_neg", e_value=E_VALUE_CUTOFF)
 
     # Parse hits from both searches
-    predicted_pos_hits_from_tbl = parse_tblout(val_pos_tbl, e_value_cutoff)
-    predicted_neg_hits_from_tbl = parse_tblout(val_neg_tbl, e_value_cutoff)
+    predicted_pos_hits_from_tbl = parse_tblout(val_pos_tbl, E_VALUE_CUTOFF)
+    predicted_neg_hits_from_tbl = parse_tblout(val_neg_tbl, E_VALUE_CUTOFF)
 
     # Combine all predicted hits. Note: If a non-Kunitz sequence accidentally gets a hit, it's a FP.
     predicted_overall_hits = predicted_pos_hits_from_tbl.union(predicted_neg_hits_from_tbl)
 
     # Load ALL true labels for the entire validation set (positives and negatives)
-    true_labels = load_labels(validation_labels_txt)
+    true_labels = load_labels(VALIDATION_LABELS_TXT)
 
     # Filter predicted_overall_hits to only include IDs present in our true_labels (validation set)
     # This prevents issues if hmmsearch finds hits in sequences not meant for validation.
@@ -352,26 +344,16 @@ if __name__ == "__main__":
 
     print("\n--- 4. Evaluating Model Performance ---")
     metrics = evaluate_performance(final_predicted_hits_for_eval, true_labels)
-    print("\n--- Generating Metric Visualizations ---")
-confusion_bar_plot_path = output_dir / "confusion_matrix_bar.png"
-metrics_summary_plot_path = output_dir / "performance_metrics_summary.png"
 
-try:
-    plot_confusion_bar(metrics, confusion_bar_plot_path)
-    print(f"Confusion matrix bar plot saved to {confusion_bar_plot_path}")
-    plot_metrics_summary(metrics, metrics_summary_plot_path)
-    print(f"Performance metrics summary plot saved to {metrics_summary_plot_path}")
-except Exception as e:
-    print(f"WARNING: Could not generate additional metric plots: {e}", file=sys.stderr)
     print("\n--- Combined Validation Performance ---")
-    with open(output_dir / "validation_metrics.txt", "w") as f_metrics:
+    with open(run_output_dir / "validation_metrics.txt", "w") as f_metrics:
         for key, val in metrics.items():
             line = f"  {key}: {val:.4f}" if isinstance(val, float) else f"  {key}: {val}"
             print(line)
             f_metrics.write(line + "\n")
-    print(f"Metrics saved to {output_dir / 'validation_metrics.txt'}")
+    print(f"Metrics saved to {run_output_dir / 'validation_metrics.txt'}")
 
-    confusion_counts_path = output_dir / "confusion_matrix_counts.json"
+    confusion_counts_path = run_output_dir / "confusion_matrix_counts.json"
     confusion_counts = {
         "TP": metrics["TP"],
         "FP": metrics["FP"],
@@ -383,8 +365,8 @@ except Exception as e:
     print(f"Confusion matrix counts saved to {confusion_counts_path}")
 
     print("\n--- Generating Metric Visualizations ---")
-    confusion_bar_plot_path = output_dir / "confusion_matrix_bar.png"
-    metrics_summary_plot_path = output_dir / "performance_metrics_summary.png"
+    confusion_bar_plot_path = run_output_dir / "confusion_matrix_bar.png"
+    metrics_summary_plot_path = run_output_dir / "performance_metrics_summary.png"
 
     try:
         plot_confusion_bar(metrics, confusion_bar_plot_path)
@@ -408,8 +390,8 @@ except Exception as e:
         elif not is_predicted and is_positive_true:
             false_negatives.append(seq_id)
 
-    fp_path = output_dir / "false_positives.txt"
-    fn_path = output_dir / "false_negatives.txt"
+    fp_path = run_output_dir / "false_positives.txt"
+    fn_path = run_output_dir / "false_negatives.txt"
 
     with open(fp_path, "w") as f:
         for seq_id in sorted(false_positives):
@@ -429,25 +411,25 @@ except Exception as e:
 
 
     print("\n--- 6. Annotating Full SwissProt Database ---")
-    if not swissprot_fasta.exists():
-        print(f"Skipping full SwissProt scan because '{swissprot_fasta}' was not found.")
+    if not SWISSPROT_FASTA.exists():
+        print(f"Skipping full SwissProt scan because '{SWISSPROT_FASTA}' was not found.")
         print("Please download it (e.g., from UniProt FTP) and place it in `data/swissprot_database/`.", file=sys.stderr)
     else:
-        swiss_tbl = run_hmmsearch(hmm_file, swissprot_fasta, output_dir, tag="swissprot_scan", e_value=e_value_cutoff)
-        swiss_hits = parse_tblout(swiss_tbl, e_value_cutoff)
+        swiss_tbl = run_hmmsearch(hmm_file, SWISSPROT_FASTA, run_output_dir, tag="swissprot_scan", e_value=E_VALUE_CUTOFF)
+        swiss_hits = parse_tblout(swiss_tbl, E_VALUE_CUTOFF)
         print(f"Total Kunitz domains predicted in SwissProt: {len(swiss_hits)}")
 
-        swissprot_hits_file = output_dir / "predicted_kunitz_domains_swissprot.txt"
+        swissprot_hits_file = run_output_dir / "predicted_kunitz_domains_swissprot.txt"
         with open(swissprot_hits_file, "w") as f:
             for hit_id in sorted(swiss_hits):
                 f.write(hit_id + "\n")
         print(f"List of predicted Kunitz domains in SwissProt saved to {swissprot_hits_file}")
 
     print("\n--- 7. Generating HMM Logo ---")
-    run_hmmlogo(hmm_file, output_dir)
+    run_hmmlogo(hmm_file, run_output_dir)
 
     # Save a copy of the config for reproducibility
-    config_copy_path = output_dir / "config.yaml"
+    config_copy_path = run_output_dir / "config.yaml"
     try:
         original_config_file = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
         with open(original_config_file, 'r') as src_file:
@@ -459,4 +441,4 @@ except Exception as e:
         print(f"WARNING: Could not save a copy of config.yaml: {e}", file=sys.stderr)
 
 
-    print(f"\n✅ Pipeline finished. All results are in: {output_dir}")
+    print(f"\n✅ Pipeline finished. All results are in: {run_output_dir}")
