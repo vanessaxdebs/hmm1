@@ -21,7 +21,7 @@ validation_labels_txt: data/validation_datasets/validation_labels.txt
 swissprot_fasta: data/swissprot_database/uniprot_sprot.fasta
 
 # --- HMMER Parameters ---
-e_value_cutoff: 0.001 # E-value threshold for hmmsearch hits
+e_value_cutoff: 0.00001 # SIGNIFICANTLY LOWERED E-value threshold for hmmsearch hits (1e-5)
 
 # --- Negative Set Generation Strategy ---
 # Choose between 'random_swissprot' or 'structurally_similar'
