@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Kunitz-type Protease Inhibitor Domain - HMM Profile Pipeline (Biopython version)
@@ -13,11 +14,9 @@ from typing import Dict, Set, Tuple
 import yaml
 from datetime import datetime
 from Bio import SeqIO
-import yaml
-from datetime import datetime
-from Bio import SeqIO
-import json # <--- Make sure this is here or with other imports
-from visualize_metrics import plot_confusion_bar, plot_metrics_summary
+import json # Moved to top
+# import matplotlib.pyplot as plt # Not directly needed in hmm.py, removed
+from visualize_metrics import plot_confusion_bar, plot_metrics_summary # Import plotting functions
 
 # ---------- Biopython-based utilities ----------
 
@@ -118,7 +117,6 @@ def load_config(config_file: Path = None) -> Dict:
         'validation_negatives_labels': str, # Path to negative_labels.txt
         'swissprot_fasta': str, # Path to uniprot_sprot.fasta
         'e_value_cutoff': float,
-        # 'pdb_id': str # This field seems redundant for the overall HMM pipeline
     }
     try:
         with open(config_file, 'r') as f:
@@ -201,8 +199,7 @@ def parse_tblout(tbl_file: Path, e_value_cutoff: float) -> Set[str]:
                 if len(parts) >= 13: # Ensure enough columns for E-value
                     try:
                         target_name = parts[0]
-                        e_value = float(parts[4]) # E-value is typically the 5th column (index 4) in the main table, NOT the domain table.
-                                                   # For --domtblout, it's parts[12]. For --tblout, it's parts[4].
+                        e_value = float(parts[4]) # E-value is typically the 5th column (index 4) in the main table
                         if e_value < e_value_cutoff:
                             hits.add(target_name)
                     except ValueError:
@@ -310,7 +307,7 @@ if __name__ == "__main__":
     if not check_fasta(validation_neg_fasta): all_ok = False
     if not check_label_txt(validation_neg_labels): all_ok = False
     # Swissprot fasta can be downloaded by a separate script if not present
-    # if not check_fasta(swissprot_fasta): all_ok = False # Might be downloaded by other script
+    # if not check_fasta(swissprot_fasta): all_ok = False # This check is now done later, if the file exists
 
     if not all_ok:
         print("\nERROR: Some required input files are missing or invalid. Please check the 'data/' directory and run previous scripts.", file=sys.stderr)
@@ -349,17 +346,7 @@ if __name__ == "__main__":
 
     print("\n--- 4. Evaluating Model Performance ---")
     metrics = evaluate_performance(all_predicted_hits_in_validation, true_labels)
-    import json # This import should ideally be at the top of the file
-    confusion_counts_path = output_dir / "confusion_matrix_counts.json"
-    confusion_counts = {
-        "TP": metrics["TP"],
-        "FP": metrics["FP"],
-        "FN": metrics["FN"],
-        "TN": metrics["TN"]
-    }
-    with open(confusion_counts_path, "w") as f:
-        json.dump(confusion_counts, f, indent=4)
-    print(f"Confusion matrix counts saved to {confusion_counts_path}")
+
     print("\n--- Combined Validation Performance ---")
     with open(output_dir / "validation_metrics.txt", "w") as f_metrics:
         for key, val in metrics.items():
@@ -368,8 +355,7 @@ if __name__ == "__main__":
             f_metrics.write(line + "\n")
     print(f"Metrics saved to {output_dir / 'validation_metrics.txt'}")
 
-      # Save raw confusion matrix counts to a JSON file for plotting
-    import json # Ensure json is imported at the top of the file, or here if not already
+    # Save raw confusion matrix counts to a JSON file for plotting
     confusion_counts_path = output_dir / "confusion_matrix_counts.json"
     confusion_counts = {
         "TP": metrics["TP"],
@@ -381,7 +367,6 @@ if __name__ == "__main__":
         json.dump(confusion_counts, f, indent=4)
     print(f"Confusion matrix counts saved to {confusion_counts_path}")
 
-    # --- The calls to plot_confusion_bar and plot_metrics_summary should come AFTER these two blocks ---
     print("\n--- Generating Metric Visualizations ---")
     
     # Define paths for the new plots
@@ -449,5 +434,17 @@ if __name__ == "__main__":
 
     print("\n--- 7. Generating HMM Logo ---")
     run_hmmlogo(hmm_file, output_dir)
+
+    # Save a copy of the config for reproducibility
+    config_copy_path = output_dir / "config.yaml"
+    try:
+        with open(find_config(), 'r') as src_file:
+            config_content = yaml.safe_load(src_file)
+        with open(config_copy_path, 'w') as dest_file:
+            yaml.safe_dump(config_content, dest_file, indent=4, sort_keys=False)
+        print(f"Configuration for this run saved to {config_copy_path}")
+    except Exception as e:
+        print(f"WARNING: Could not save a copy of config.yaml: {e}", file=sys.stderr)
+
 
     print(f"\n✅ Pipeline finished. All results are in: {output_dir}")
