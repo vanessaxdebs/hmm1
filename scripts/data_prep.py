@@ -45,6 +45,8 @@ def load_config(config_file: Path = None) -> dict:
         'swissprot_fasta': str,
         'e_value_cutoff': float,
         'negative_set_strategy': str, # New required field
+        'clustering_identity_threshold': float, # New required field
+        'clustering_length_difference_cutoff': float, # New required field
     }
 
     try:
@@ -152,16 +154,76 @@ def parse_fasta_ids(fasta_file: Path) -> set:
         sys.exit(1)
     return ids
 
-def extract_pfam_kunitz_sequences(pfam_full_alignment_gz: Path, training_ids: set, output_fasta: Path) -> int:
+def run_cdhit(input_fasta: Path, output_fasta: Path, identity_threshold: float, length_diff_cutoff: float) -> int:
+    """
+    Runs CD-HIT to perform sequence clustering (redundancy reduction).
+    Args:
+        input_fasta (Path): Path to the input FASTA file.
+        output_fasta (Path): Path to the output clustered FASTA file.
+        identity_threshold (float): Sequence identity threshold (e.g., 0.9 for 90%).
+        length_diff_cutoff (float): Length difference cutoff (e.g., 0.9 for 90% length overlap).
+    Returns:
+        int: Number of sequences in the clustered output.
+    """
+    print(f"Running CD-HIT on {input_fasta.name} at {identity_threshold*100}% identity...")
+    
+    # CD-HIT output files
+    clstr_file = output_fasta.with_suffix('.clstr')
+
+    # Construct the CD-HIT command
+    # -i input_fasta: input FASTA file
+    # -o output_fasta: output non-redundant FASTA file
+    # -c identity_threshold: sequence identity threshold (e.g., 0.9 for 90%)
+    # -aS length_diff_cutoff: alignment coverage for the longer sequence (e.g., 0.9 for 90%)
+    # -g 1: greedy clustering (default)
+    # -T 0: use all available threads (0 means auto)
+    # -M 0: use all available memory (0 means auto)
+    cmd = [
+        "cd-hit",
+        "-i", str(input_fasta),
+        "-o", str(output_fasta),
+        "-c", str(identity_threshold),
+        "-aS", str(length_diff_cutoff),
+        "-g", "1",
+        "-T", "0",
+        "-M", "0"
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        # Check if output file was actually created and is not empty
+        if not output_fasta.exists() or output_fasta.stat().st_size == 0:
+            print(f"WARNING: CD-HIT ran, but output file '{output_fasta}' is missing or empty. Check CD-HIT logs.", file=sys.stderr)
+            return 0
+        
+        # Count sequences in the output FASTA
+        clustered_count = sum(1 for _ in SeqIO.parse(output_fasta, "fasta"))
+        print(f"CD-HIT clustering completed. Retained {clustered_count} non-redundant sequences.")
+        return clustered_count
+    except FileNotFoundError:
+        print("ERROR: cd-hit command not found. Please install CD-HIT or ensure it's in your PATH.", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: CD-HIT failed: {e.stderr}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"An unexpected error occurred during CD-HIT execution: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def extract_pfam_kunitz_sequences(pfam_full_alignment_gz: Path, training_ids: set, output_fasta: Path, config: dict) -> int:
     """
     Extracts Kunitz sequences from the Pfam full alignment,
     excluding those present in the training_ids set, and writes to a FASTA file.
+    Applies CD-HIT for redundancy reduction.
     """
     print(f"Extracting Kunitz sequences from {pfam_full_alignment_gz} (excluding training sequences)...")
+    temp_fasta_path = output_fasta.parent / f"temp_{output_fasta.name}" # Temp file before clustering
     extracted_count = 0
     unique_extracted_ids = set()
+
     try:
-        with gzip.open(pfam_full_alignment_gz, "rt") as f_in, open(output_fasta, "w") as f_out:
+        with gzip.open(pfam_full_alignment_gz, "rt") as f_in, open(temp_fasta_path, "w") as f_out:
             for record in AlignIO.read(f_in, "stockholm"):
                 # Pfam IDs are typically like 'UNIPROTACCESSION/START-END' or 'PDBID_CHAIN/START-END'
                 # We need to ensure consistency with training_ids format.
@@ -181,8 +243,22 @@ def extract_pfam_kunitz_sequences(pfam_full_alignment_gz: Path, training_ids: se
     except Exception as e:
         print(f"ERROR: Failed to extract Kunitz sequences from Pfam alignment: {e}", file=sys.stderr)
         sys.exit(1)
-    print(f"Identified {extracted_count} unique positive validation sequences.")
-    return extracted_count
+    
+    print(f"Identified {extracted_count} raw positive validation sequences before clustering.")
+
+    # Apply CD-HIT for redundancy reduction
+    if extracted_count > 0:
+        clustered_count = run_cdhit(temp_fasta_path, output_fasta, 
+                                     config['clustering_identity_threshold'], 
+                                     config['clustering_length_difference_cutoff'])
+        os.remove(temp_fasta_path) # Clean up temporary file
+        print(f"Successfully wrote {clustered_count} clustered positive validation sequences to {output_fasta}.")
+        return clustered_count
+    else:
+        print(f"No sequences to cluster for positive validation set.")
+        if temp_fasta_path.exists(): os.remove(temp_fasta_path)
+        return 0
+
 
 def sample_non_kunitz_from_swissprot(swissprot_fasta: Path, num_samples: int, output_fasta: Path) -> int:
     """
@@ -226,11 +302,12 @@ def sample_non_kunitz_from_swissprot(swissprot_fasta: Path, num_samples: int, ou
 
 
 def prepare_structurally_similar_negative_set(
-    pdb_ids: list, pdb_chains: dict, output_fasta: Path, raw_pdb_dir: Path, chain_dir: Path
+    pdb_ids: list, pdb_chains: dict, output_fasta: Path, raw_pdb_dir: Path, chain_dir: Path, config: dict
 ) -> int:
     """
     Downloads PDBs for a list of structurally similar (but non-Kunitz) proteins,
     extracts specified chains, and writes their sequences to a FASTA file.
+    Applies CD-HIT for redundancy reduction.
     """
     print(f"Preparing Structurally Similar Negative Validation Set (from {len(pdb_ids)} PDBs)...")
     pdbl = PDBList()
@@ -238,6 +315,8 @@ def prepare_structurally_similar_negative_set(
 
     os.makedirs(raw_pdb_dir, exist_ok=True)
     os.makedirs(chain_dir, exist_ok=True)
+
+    temp_fasta_path = output_fasta.parent / f"temp_{output_fasta.name}" # Temp file before clustering
 
     for pdb_id in pdb_ids:
         chain_id = pdb_chains.get(pdb_id)
@@ -277,18 +356,24 @@ def prepare_structurally_similar_negative_set(
         print("ERROR: No sequences extracted for structurally similar negative set. Check PDB IDs/chains and pdb_selchain installation.", file=sys.stderr)
         sys.exit(1)
 
-    # Optional: Add redundancy reduction here if the list of PDBs is large/redundant
-    # For this small example, we'll skip CD-HIT, but it's good practice.
-
+    # Write raw extracted sequences to a temporary FASTA
     try:
-        with open(output_fasta, "w") as f_out:
+        with open(temp_fasta_path, "w") as f_out:
             SeqIO.write(extracted_sequences, f_out, "fasta")
     except Exception as e:
-        print(f"ERROR: Failed to write structurally similar negative validation FASTA: {e}", file=sys.stderr)
+        print(f"ERROR: Failed to write temporary structurally similar negative validation FASTA: {e}", file=sys.stderr)
         sys.exit(1)
+    
+    print(f"Identified {len(extracted_sequences)} raw structurally similar negative sequences before clustering.")
 
-    print(f"Successfully wrote {len(extracted_sequences)} structurally similar negative validation sequences to {output_fasta}.")
-    return len(extracted_sequences)
+    # Apply CD-HIT for redundancy reduction
+    clustered_count = run_cdhit(temp_fasta_path, output_fasta, 
+                                 config['clustering_identity_threshold'], 
+                                 config['clustering_length_difference_cutoff'])
+    os.remove(temp_fasta_path) # Clean up temporary file
+
+    print(f"Successfully wrote {clustered_count} clustered structurally similar negative validation sequences to {output_fasta}.")
+    return clustered_count
 
 
 def create_validation_labels(positive_fasta: Path, negative_fasta: Path, output_labels: Path) -> None:
@@ -351,7 +436,7 @@ if __name__ == "__main__":
         print(f"Please download 'PF00014.full.gz' from Pfam (https://pfam.xfam.org/family/PF00014) and place it in '{pfam_full_alignment_gz.parent}'.", file=sys.stderr)
         sys.exit(1)
 
-    extract_pfam_kunitz_sequences(pfam_full_alignment_gz, training_ids, positive_validation_fasta_path)
+    extract_pfam_kunitz_sequences(pfam_full_alignment_gz, training_ids, positive_validation_fasta_path, CONFIG)
     if not positive_validation_fasta_path.exists() or positive_validation_fasta_path.stat().st_size == 0:
         print("ERROR: Positive validation FASTA was not generated correctly.", file=sys.stderr)
         sys.exit(1)
@@ -372,7 +457,8 @@ if __name__ == "__main__":
             CONFIG['structurally_similar_negative_pdb_chains'],
             non_kunitz_validation_fasta_path,
             raw_pdb_dir,
-            chain_dir
+            chain_dir,
+            CONFIG # Pass config for clustering parameters
         )
     
     if not non_kunitz_validation_fasta_path.exists() or non_kunitz_validation_fasta_path.stat().st_size == 0:
