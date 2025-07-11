@@ -7,7 +7,7 @@ structure-informed Profile Hidden Markov Model (HMM) for the Kunitz domain.
 import os
 import sys
 import subprocess
-import gzip # Added for check_stockholm/fasta if they handle gzipped files
+import gzip
 import json
 from pathlib import Path
 from datetime import datetime
@@ -38,9 +38,11 @@ def load_config(config_file: Path = None) -> dict:
         print(f"ERROR: Config file not found at {config_file}", file=sys.stderr)
         sys.exit(1)
 
+    # IMPORTANT: 'output_dir' is NOT in config.yaml directly. It's derived from 'results_dir'.
+    # So, 'results_dir' should be in required_fields, not 'output_dir'.
     required_fields = {
         'data_dir': str,
-        'results_dir': str,
+        'results_dir': str, # Corrected: Expect results_dir, not output_dir
         'scripts_dir': str,
         'config_dir': str,
         'seed_alignment': str,
@@ -50,8 +52,8 @@ def load_config(config_file: Path = None) -> dict:
         'swissprot_fasta': str,
         'e_value_cutoff': float,
         'negative_set_strategy': str,
-        'clustering_identity_threshold': float,
-        'clustering_length_difference_cutoff': float,
+        'clustering_identity_threshold': float, # Added for consistency
+        'clustering_length_difference_cutoff': float, # Added for consistency
     }
 
     try:
@@ -81,6 +83,7 @@ def load_config(config_file: Path = None) -> dict:
             sys.exit(1)
 
         # Convert path strings to Path objects for easier handling AFTER all validation
+        # This is done here to ensure all config values are validated before path conversion
         config['data_dir'] = Path(config['data_dir'])
         config['results_dir'] = Path(config['results_dir'])
         config['scripts_dir'] = Path(config['scripts_dir'])
@@ -405,7 +408,7 @@ if __name__ == "__main__":
         plot_confusion_bar(metrics, confusion_bar_plot_path)
         print(f"Confusion matrix bar plot saved to {confusion_bar_plot_path}")
         plot_metrics_summary(metrics, metrics_summary_plot_path)
-        print(f"Performance metrics summary plot saved to {metrics_summary_plot_path}")
+        print(f"Performance metrics bar chart saved to {metrics_summary_plot_path}")
     except Exception as e:
         print(f"WARNING: Could not generate additional metric plots: {e}", file=sys.stderr)
 
