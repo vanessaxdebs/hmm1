@@ -1,237 +1,390 @@
 #!/usr/bin/env python3
 """
-Script to prepare data for the HMM pipeline.
-It generates:
-- positive_validation.fasta (Kunitz domains NOT in training seed)
-- non_kunitz_proteins.fasta (sequences from Swiss-Prot that do not hit the Kunitz HMM)
-- validation_labels.txt (combined labels for positive_validation.fasta and negative_validation.fasta)
+Prepares validation datasets (positive and negative) and the full SwissProt database
+for the Kunitz HMM pipeline.
+This script ensures the validation sets are independent of the training data.
 """
 
-import gzip
-from pathlib import Path
+import os
 import sys
 import subprocess
-from Bio import SeqIO
+import gzip
+from pathlib import Path
 import yaml
+from Bio import AlignIO, SeqIO
+from Bio.PDB import PDBList # For downloading PDBs for structurally similar negatives
+from Bio.SeqRecord import SeqRecord
+from Bio.Seq import Seq
 
-def find_config() -> Path:
-    """Finds the config.yaml file relative to the script's location."""
-    script_dir = Path(__file__).parent
-    print(f"DEBUG: script_dir (parent of data_prep.py): {script_dir}", file=sys.stderr) # ADD THIS
-    project_root_guess = script_dir.parent
-    print(f"DEBUG: project_root_guess: {project_root_guess}", file=sys.stderr) # ADD THIS
-    config_path = project_root_guess / "config" / "config.yaml"
-    print(f"DEBUG: config_path that script is looking for: {config_path}", file=sys.stderr) # ADD THIS
+# --- Helper Functions (from your existing scripts) ---
 
-    if config_path.exists():
-        print(f"DEBUG: config_path.exists() returned TRUE: {config_path}", file=sys.stderr) # ADD THIS
-        return config_path.resolve()
-    else: # ADD THIS
-        print(f"DEBUG: config_path.exists() returned FALSE for: {config_path}", file=sys.stderr) # ADD THIS
-    raise FileNotFoundError("config.yaml not found! Ensure it's in 'config/' relative to the project root.")
+def load_config(config_file: Path = None) -> dict:
+    """Loads configuration from a YAML file."""
+    if config_file is None:
+        # Assume config.yaml is in a 'config' directory one level up from 'scripts'
+        script_dir = Path(__file__).resolve().parent
+        project_root_guess = script_dir.parent
+        config_file = project_root_guess / "config" / "config.yaml"
 
-def load_config() -> dict:
-    """Loads and returns the configuration from config.yaml."""
+    print(f"DEBUG: script_dir (parent of data_prep.py): {script_dir}")
+    print(f"DEBUG: project_root_guess: {project_root_guess}")
+    print(f"DEBUG: config_path that script is looking for: {config_file}")
+    print(f"DEBUG: config_path.exists() returned {config_file.exists()}: {config_file}")
+
+    if not config_file.exists():
+        print(f"ERROR: Config file not found at {config_file}", file=sys.stderr)
+        sys.exit(1)
+
+    required_fields = {
+        'data_dir': str,
+        'results_dir': str,
+        'seed_alignment': str,
+        'positive_validation_fasta': str,
+        'non_kunitz_validation_fasta': str,
+        'validation_labels_txt': str,
+        'swissprot_fasta': str,
+        'e_value_cutoff': float,
+        'negative_set_strategy': str, # New required field
+    }
+
     try:
-        config_file = find_config()
         with open(config_file, 'r') as f:
             config = yaml.safe_load(f)
-        
-        # Resolve paths relative to the project root
-        project_root = Path(__file__).resolve().parent.parent
-        for key in ['seed_alignment', 'pfam_kunitz_full_alignment',
-                    'positive_validation_fasta', 'non_kunitz_validation_fasta',
-                    'validation_labels_txt', 'swissprot_fasta']:
-            if key in config and config[key] is not None:
-                config[key] = project_root / Path(config[key])
+
+        # Validate required fields
+        for field, expected_type in required_fields.items():
+            if field not in config or not isinstance(config[field], expected_type):
+                print(f"ERROR: Missing or invalid field '{field}' in config.yaml. Expected type: {expected_type.__name__}", file=sys.stderr)
+                sys.exit(1)
+
+        # Convert path strings to Path objects for easier handling
+        config['data_dir'] = Path(config['data_dir'])
+        config['results_dir'] = Path(config['results_dir'])
+        config['seed_alignment'] = Path(config['seed_alignment'])
+        config['positive_validation_fasta'] = Path(config['positive_validation_fasta'])
+        config['non_kunitz_validation_fasta'] = Path(config['non_kunitz_validation_fasta'])
+        config['validation_labels_txt'] = Path(config['validation_labels_txt'])
+        config['swissprot_fasta'] = Path(config['swissprot_fasta'])
+
+        # Validate strategy-specific fields
+        if config['negative_set_strategy'] == 'random_swissprot':
+            if 'num_negative_samples' not in config or not isinstance(config['num_negative_samples'], int):
+                print("ERROR: 'num_negative_samples' missing or invalid for 'random_swissprot' strategy.", file=sys.stderr)
+                sys.exit(1)
+        elif config['negative_set_strategy'] == 'structurally_similar':
+            if 'structurally_similar_negative_pdb_ids' not in config or not isinstance(config['structurally_similar_negative_pdb_ids'], list):
+                print("ERROR: 'structurally_similar_negative_pdb_ids' missing or invalid for 'structurally_similar' strategy.", file=sys.stderr)
+                sys.exit(1)
+            if 'structurally_similar_negative_pdb_chains' not in config or not isinstance(config['structurally_similar_negative_pdb_chains'], dict):
+                print("ERROR: 'structurally_similar_negative_pdb_chains' missing or invalid for 'structurally_similar' strategy.", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(f"ERROR: Unknown negative_set_strategy: {config['negative_set_strategy']}", file=sys.stderr)
+            sys.exit(1)
+
         return config
+
+    except yaml.YAMLError as e:
+        print(f"ERROR: Error parsing config.yaml: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def get_full_path(relative_path: Path) -> Path:
+    """Converts a relative Path object to an absolute Path relative to project root."""
+    script_dir = Path(__file__).resolve().parent
+    project_root = script_dir.parent # Assuming scripts/data_prep.py is one level below project root
+    return project_root / relative_path
+
+def check_stockholm(file_path: Path) -> bool:
+    """Checks if a Stockholm file exists and is not empty."""
+    if not file_path.exists():
+        print(f"ERROR: Stockholm file '{file_path}' not found.", file=sys.stderr)
+        return False
+    if file_path.stat().st_size == 0:
+        print(f"ERROR: Stockholm file '{file_path}' is empty.", file=sys.stderr)
+        return False
+    return True
+
+def check_fasta(file_path: Path) -> bool:
+    """Checks if a FASTA file exists and is not empty."""
+    if not file_path.exists():
+        print(f"ERROR: FASTA file '{file_path}' not found.", file=sys.stderr)
+        return False
+    if file_path.stat().st_size == 0:
+        print(f"ERROR: FASTA file '{file_path}' is empty.", file=sys.stderr)
+        return False
+    return True
+
+def check_label_txt(file_path: Path) -> bool:
+    """Checks if a label file exists and is not empty."""
+    if not file_path.exists():
+        print(f"ERROR: Label file '{file_path}' not found.", file=sys.stderr)
+        return False
+    if file_path.stat().st_size == 0:
+        print(f"ERROR: Label file '{file_path}' is empty.", file=sys.stderr)
+        return False
+    return True
+
+def parse_stockholm_ids(stockholm_file: Path) -> set:
+    """Parses a Stockholm file and returns a set of sequence IDs."""
+    ids = set()
+    try:
+        # AlignIO can handle gzipped files directly if given the 'gz' mode
+        if str(stockholm_file).endswith('.gz'):
+            with gzip.open(stockholm_file, 'rt') as f:
+                for record in AlignIO.read(f, "stockholm"):
+                    ids.add(record.id)
+        else:
+            for record in AlignIO.read(stockholm_file, "stockholm"):
+                ids.add(record.id)
     except Exception as e:
-        print(f"ERROR: Could not load configuration: {e}", file=sys.stderr)
+        print(f"ERROR: Could not parse Stockholm file '{stockholm_file}': {e}", file=sys.stderr)
         sys.exit(1)
+    return ids
 
-def run_hmmbuild(seed_alignment: Path, hmm_file: Path):
-    """Trains a Profile HMM using HMMER's hmmbuild."""
-    cmd = ["hmmbuild", str(hmm_file), str(seed_alignment)]
-    print(f"Building temporary HMM for negative set generation: {' '.join(cmd)}")
+def parse_fasta_ids(fasta_file: Path) -> set:
+    """Parses a FASTA file and returns a set of sequence IDs."""
+    ids = set()
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"Temporary HMM built successfully: {hmm_file}")
-    except FileNotFoundError:
-        print("ERROR: hmmbuild command not found. Please ensure HMMER is installed and in your PATH.", file=sys.stderr)
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: hmmbuild failed during negative set generation. Stderr:\n{e.stderr}", file=sys.stderr)
-        sys.exit(1)
-
-def run_hmmsearch_temp(hmm_file: Path, fasta_file: Path, tblout_file: Path, e_value: float = 1e-5):
-    """Runs hmmsearch for temporary purposes (e.g., to find non-hits)."""
-    cmd = [
-        "hmmsearch",
-        "--tblout", str(tblout_file),
-        "-E", str(e_value),
-        "--noali",
-        str(hmm_file), str(fasta_file)
-    ]
-    print(f"Running temporary hmmsearch on {fasta_file.name} to find Kunitz sequences...")
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"Temporary hmmsearch results saved to {tblout_file}")
-    except FileNotFoundError:
-        print("ERROR: hmmsearch command not found. Please ensure HMMER is installed and in your PATH.", file=sys.stderr)
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: temporary hmmsearch failed on {fasta_file.name}. Stderr:\n{e.stderr}", file=sys.stderr)
-        sys.exit(1)
-
-def parse_tblout_for_hits(tbl_file: Path, e_value_cutoff: float) -> set[str]:
-    """Parses hmmsearch --tblout and returns a set of unique hit IDs passing the E-value cutoff."""
-    hits = set()
-    if not tbl_file.exists() or tbl_file.stat().st_size == 0:
-        print(f"WARNING: tblout file {tbl_file} is missing or empty. No hits parsed.", file=sys.stderr)
-        return hits
-    try:
-        with open(tbl_file, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                if line.startswith("#"):
-                    continue
-                parts = line.split()
-                if len(parts) >= 13: # Standard HMMER tblout has at least 13 columns for hit line
-                    try:
-                        target_name = parts[0]
-                        e_value = float(parts[4])
-                        if e_value < e_value_cutoff:
-                            hits.add(target_name)
-                    except ValueError:
-                        continue # Skip malformed lines
-        return hits
+        for record in SeqIO.parse(fasta_file, "fasta"):
+            ids.add(record.id)
     except Exception as e:
-        print(f"ERROR: Error parsing temporary tblout file {tbl_file}: {e}", file=sys.stderr)
+        print(f"ERROR: Could not parse FASTA file '{fasta_file}': {e}", file=sys.stderr)
         sys.exit(1)
+    return ids
 
-
-def prepare_data():
-    config = load_config()
-
-    seed_sto_path = config['seed_alignment']
-    pfam_gz_path = config['pfam_kunitz_full_alignment']
-    swissprot_fasta_path = config['swissprot_fasta']
-
-    output_pos_fasta_path = config['positive_validation_fasta']
-    output_neg_fasta_path = config['non_kunitz_validation_fasta'] # This is now the auto-generated one
-    output_labels_txt_path = config['validation_labels_txt']
-    
-    negative_set_filter_e_value = config['negative_set_filter_e_value']
-    max_negative_sequences = config['max_negative_sequences']
-
-    # Create parent directories if they don't exist
-    output_pos_fasta_path.parent.mkdir(parents=True, exist_ok=True)
-
-
-    print(f"--- Preparing Validation Datasets ---")
-
-    # --- Step 1: Prepare Positive Validation Set ---
-    print(f"\n1. Preparing Positive Validation Set (Kunitz domains not in training data)...")
-    print(f"Loading training IDs from: {seed_sto_path}")
-    training_ids = set()
+def extract_pfam_kunitz_sequences(pfam_full_alignment_gz: Path, training_ids: set, output_fasta: Path) -> int:
+    """
+    Extracts Kunitz sequences from the Pfam full alignment,
+    excluding those present in the training_ids set, and writes to a FASTA file.
+    """
+    print(f"Extracting Kunitz sequences from {pfam_full_alignment_gz} (excluding training sequences)...")
+    extracted_count = 0
+    unique_extracted_ids = set()
     try:
-        for record in SeqIO.parse(seed_sto_path, "stockholm"):
-            training_ids.add(record.id.split('/')[0]) # Handle UniProt IDs with /start-end
-        print(f"Found {len(training_ids)} training sequence IDs.")
+        with gzip.open(pfam_full_alignment_gz, "rt") as f_in, open(output_fasta, "w") as f_out:
+            for record in AlignIO.read(f_in, "stockholm"):
+                # Pfam IDs are typically like 'UNIPROTACCESSION/START-END' or 'PDBID_CHAIN/START-END'
+                # We need to ensure consistency with training_ids format.
+                # For now, assume record.id matches training_ids format directly.
+                if record.id not in training_ids:
+                    # Create a new SeqRecord without alignment gaps for FASTA output
+                    clean_seq = str(record.seq).replace('-', '') # Remove gaps
+                    clean_record = SeqRecord(Seq(clean_seq), id=record.id, description=record.description)
+                    if clean_record.id not in unique_extracted_ids:
+                        SeqIO.write(clean_record, f_out, "fasta")
+                        unique_extracted_ids.add(clean_record.id)
+                        extracted_count += 1
     except FileNotFoundError:
-        print(f"ERROR: Training seed file '{seed_sto_path}' not found.", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"ERROR: Could not parse training seed '{seed_sto_path}': {e}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Extracting Kunitz sequences from {pfam_gz_path} (excluding training sequences)...")
-    positive_validation_sequences = {}
-    try:
-        with gzip.open(pfam_gz_path, "rt") as f_in:
-            for record in SeqIO.parse(f_in, "stockholm"):
-                record_id_base = record.id.split('/')[0] # Get base ID
-                if record_id_base not in training_ids:
-                    # Remove any alignment gaps ('-') or padding ('.')
-                    positive_validation_sequences[record_id_base] = str(record.seq).replace('-', '').replace('.', '')
-        print(f"Identified {len(positive_validation_sequences)} unique positive validation sequences.")
-    except FileNotFoundError:
-        print(f"ERROR: Pfam Kunitz full alignment '{pfam_gz_path}' not found.", file=sys.stderr)
-        print("Please download it (e.g., PF00014.full.gz from Pfam FTP) and place it in 'data/validation_datasets/'.", file=sys.stderr)
+        print(f"ERROR: Pfam Kunitz full alignment '{pfam_full_alignment_gz}' not found.", file=sys.stderr)
+        print(f"Please download it (e.g., PF00014.full.gz from Pfam FTP) and place it in '{pfam_full_alignment_gz.parent}'.", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"ERROR: Could not parse Pfam source file '{pfam_gz_path}': {e}", file=sys.stderr)
+        print(f"ERROR: Failed to extract Kunitz sequences from Pfam alignment: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Identified {extracted_count} unique positive validation sequences.")
+    return extracted_count
+
+def sample_non_kunitz_from_swissprot(swissprot_fasta: Path, num_samples: int, output_fasta: Path) -> int:
+    """
+    Samples a specified number of non-Kunitz protein sequences from the Swiss-Prot database.
+    (This function does NOT explicitly filter out Kunitz domains, assuming they are rare
+    in a random sample and will be handled by the HMM's specificity. For rigorous
+    negative set, pre-filtering for known Kunitz is recommended but complex for this script.)
+    """
+    print(f"Automatically generating Negative Validation Set (non-Kunitz proteins from Swiss-Prot)...")
+    if not swissprot_fasta.exists():
+        print(f"ERROR: Swiss-Prot FASTA file '{swissprot_fasta}' not found.", file=sys.stderr)
+        print(f"Please manually download 'uniprot_sprot.fasta' from UniProt FTP and place it in '{swissprot_fasta.parent}'.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Writing positive validation FASTA to: {output_pos_fasta_path}")
-    with open(output_pos_fasta_path, "w") as fasta_f:
-        for seq_id, seq in positive_validation_sequences.items():
-            fasta_f.write(f">{seq_id}\n{seq}\n")
-    print(f"Successfully wrote {len(positive_validation_sequences)} sequences to {output_pos_fasta_path}.")
-
-
-    # --- Step 2: Automatically Generate Negative Validation Set ---
-    print(f"\n2. Automatically generating Negative Validation Set (non-Kunitz proteins from Swiss-Prot)...")
-    if not swissprot_fasta_path.exists():
-        print(f"ERROR: Swiss-Prot FASTA file '{swissprot_fasta_path}' not found.", file=sys.stderr)
-        print("Please manually download 'uniprot_sprot.fasta' from UniProt FTP and place it in 'data/swissprot_database/'.", file=sys.stderr)
+    all_sequences = []
+    try:
+        for record in SeqIO.parse(swissprot_fasta, "fasta"):
+            all_sequences.append(record)
+    except Exception as e:
+        print(f"ERROR: Could not parse Swiss-Prot FASTA file '{swissprot_fasta}': {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Create a temporary HMM for filtering
-    temp_hmm_path = output_pos_fasta_path.parent / "temp_kunitz_filter.hmm"
-    run_hmmbuild(seed_sto_path, temp_hmm_path) # Build HMM from training seed
+    if len(all_sequences) < num_samples:
+        print(f"WARNING: Swiss-Prot contains only {len(all_sequences)} sequences, less than requested {num_samples}.", file=sys.stderr)
+        num_samples = len(all_sequences)
 
-    # Run hmmsearch against Swiss-Prot to identify Kunitz hits
-    temp_tblout_path = output_pos_fasta_path.parent / "temp_swissprot_kunitz_hits.tbl"
-    run_hmmsearch_temp(temp_hmm_path, swissprot_fasta_path, temp_tblout_path, e_value=negative_set_filter_e_value)
-    
-    kunitz_hits_in_swissprot = parse_tblout_for_hits(temp_tblout_path, negative_set_filter_e_value)
-    print(f"Found {len(kunitz_hits_in_swissprot)} Kunitz-like hits in Swiss-Prot using filter E-value {negative_set_filter_e_value}.")
+    # Use random.sample for efficient sampling without replacement
+    import random
+    random.seed(42) # For reproducibility of sampling
+    sampled_sequences = random.sample(all_sequences, num_samples)
 
-    # Collect non-Kunitz sequences from Swiss-Prot
-    non_kunitz_sequences = {}
-    print(f"Collecting non-Kunitz sequences from {swissprot_fasta_path} (excluding hits and too short/long sequences)...")
-    
-    seq_count = 0
-    with open(swissprot_fasta_path, "r") as f_in:
-        for record in SeqIO.parse(f_in, "fasta"):
-            if record.id not in kunitz_hits_in_swissprot:
-                # Basic filtering for sequence length (e.g., protein sequences between 20 and 20000 AA)
-                # Kunitz domains are small, typically 30-60 residues. So we want sequences of various lengths
-                # but avoid extremely short or extremely long sequences that might be artifacts or obscure.
-                seq_len = len(record.seq)
-                if 20 <= seq_len <= 20000:
-                    non_kunitz_sequences[record.id] = str(record.seq)
-                    seq_count += 1
-                    if seq_count >= max_negative_sequences:
-                        print(f"Reached maximum of {max_negative_sequences} negative sequences. Stopping collection.")
-                        break
-    
-    print(f"Identified {len(non_kunitz_sequences)} non-Kunitz sequences for validation (max {max_negative_sequences}).")
+    try:
+        with open(output_fasta, "w") as f_out:
+            SeqIO.write(sampled_sequences, f_out, "fasta")
+    except Exception as e:
+        print(f"ERROR: Failed to write negative validation FASTA: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    print(f"Writing negative validation FASTA to: {output_neg_fasta_path}")
-    with open(output_neg_fasta_path, "w") as fasta_f:
-        for seq_id, seq in non_kunitz_sequences.items():
-            fasta_f.write(f">{seq_id}\n{seq}\n")
-    print(f"Successfully wrote {len(non_kunitz_sequences)} sequences to {output_neg_fasta_path}.")
-
-    # Clean up temporary HMMER files
-    temp_hmm_path.unlink(missing_ok=True)
-    temp_tblout_path.unlink(missing_ok=True)
-    print("Cleaned up temporary HMMER files.")
+    print(f"Successfully wrote {len(sampled_sequences)} negative validation sequences to {output_fasta}.")
+    return len(sampled_sequences)
 
 
-    # --- Step 3: Write Combined Labels ---
-    print(f"\n3. Writing combined validation labels to: {output_labels_txt_path}")
-    with open(output_labels_txt_path, "w") as labels_f:
-        # Write positive labels (1)
-        for seq_id in positive_validation_sequences.keys():
-            labels_f.write(f"{seq_id}\t1\n")
-        # Write negative labels (0)
-        for seq_id in non_kunitz_sequences.keys():
-            labels_f.write(f"{seq_id}\t0\n")
-    print(f"Successfully wrote {len(positive_validation_sequences) + len(non_kunitz_sequences)} total labels.")
+def prepare_structurally_similar_negative_set(
+    pdb_ids: list, pdb_chains: dict, output_fasta: Path, raw_pdb_dir: Path, chain_dir: Path
+) -> int:
+    """
+    Downloads PDBs for a list of structurally similar (but non-Kunitz) proteins,
+    extracts specified chains, and writes their sequences to a FASTA file.
+    """
+    print(f"Preparing Structurally Similar Negative Validation Set (from {len(pdb_ids)} PDBs)...")
+    pdbl = PDBList()
+    extracted_sequences = []
 
-    print("\n--- Data Preparation Complete ---")
+    os.makedirs(raw_pdb_dir, exist_ok=True)
+    os.makedirs(chain_dir, exist_ok=True)
 
+    for pdb_id in pdb_ids:
+        chain_id = pdb_chains.get(pdb_id)
+        if not chain_id:
+            print(f"WARNING: No chain ID specified for PDB {pdb_id}. Skipping.", file=sys.stderr)
+            continue
+
+        print(f"  Processing PDB '{pdb_id}' chain '{chain_id}'...")
+        try:
+            pdbl_download_path = pdbl.retrieve_pdb_file(pdb_id, pdir=raw_pdb_dir, file_format="pdb")
+            chain_file_path = chain_dir / f"{pdb_id}_{chain_id}.pdb"
+
+            # Use pdb_selchain to extract the specific chain
+            subprocess.run(["pdb_selchain", f"-{chain_id}", pdbl_download_path], stdout=open(chain_file_path, "w"), check=True)
+
+            # Read the extracted chain PDB and get its sequence
+            for record in SeqIO.parse(chain_file_path, "pdb-atom"):
+                # Modify ID to be consistent with how we'd label it for validation
+                record.id = f"{pdb_id}_{chain_id}"
+                record.description = "" # Clear description to keep IDs clean
+                extracted_sequences.append(record)
+            print(f"  Extracted sequence for {pdb_id}_{chain_id}.")
+
+        except FileNotFoundError:
+            print(f"ERROR: pdb_selchain command not found or PDB {pdb_id} not downloaded. Skipping.", file=sys.stderr)
+            print("  Please ensure EMBOSS (pdb_selchain) is installed and in your PATH.", file=sys.stderr)
+            continue
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR: pdb_selchain failed for {pdb_id} chain {chain_id}: {e}", file=sys.stderr)
+            print(f"  Stderr: {e.stderr.decode()}", file=sys.stderr)
+            continue
+        except Exception as e:
+            print(f"ERROR: Failed to process {pdb_id} chain {chain_id}: {e}", file=sys.stderr)
+            continue
+
+    if not extracted_sequences:
+        print("ERROR: No sequences extracted for structurally similar negative set. Check PDB IDs/chains and pdb_selchain installation.", file=sys.stderr)
+        sys.exit(1)
+
+    # Optional: Add redundancy reduction here if the list of PDBs is large/redundant
+    # For this small example, we'll skip CD-HIT, but it's good practice.
+
+    try:
+        with open(output_fasta, "w") as f_out:
+            SeqIO.write(extracted_sequences, f_out, "fasta")
+    except Exception as e:
+        print(f"ERROR: Failed to write structurally similar negative validation FASTA: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Successfully wrote {len(extracted_sequences)} structurally similar negative validation sequences to {output_fasta}.")
+    return len(extracted_sequences)
+
+
+def create_validation_labels(positive_fasta: Path, negative_fasta: Path, output_labels: Path) -> None:
+    """
+    Creates the validation_labels.txt file by combining IDs from positive and negative FASTA files.
+    """
+    print(f"Creating validation labels file: {output_labels}...")
+    all_labels = {}
+
+    # Process positive sequences
+    for record in SeqIO.parse(positive_fasta, "fasta"):
+        all_labels[record.id] = "1" # Label as positive
+
+    # Process negative sequences
+    for record in SeqIO.parse(negative_fasta, "fasta"):
+        if record.id in all_labels:
+            print(f"WARNING: Duplicate ID '{record.id}' found in both positive and negative sets. This should not happen.", file=sys.stderr)
+        all_labels[record.id] = "0" # Label as negative
+
+    try:
+        with open(output_labels, "w") as f_out:
+            for seq_id in sorted(all_labels.keys()):
+                f_out.write(f"{seq_id}\t{all_labels[seq_id]}\n")
+    except Exception as e:
+        print(f"ERROR: Failed to write validation labels file: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Successfully created validation labels file with {len(all_labels)} entries.")
+
+
+# --- Main pipeline for data preparation ---
 if __name__ == "__main__":
-    prepare_data()
+    CONFIG = load_config()
+
+    # --- Paths from config (using get_full_path for robustness) ---
+    seed_alignment_path = get_full_path(CONFIG["seed_alignment"])
+    positive_validation_fasta_path = get_full_path(CONFIG["positive_validation_fasta"])
+    non_kunitz_validation_fasta_path = get_full_path(CONFIG["non_kunitz_validation_fasta"])
+    validation_labels_txt_path = get_full_path(CONFIG["validation_labels_txt"])
+    swissprot_fasta_path = get_full_path(CONFIG["swissprot_fasta"])
+
+    # Ensure output directories exist
+    os.makedirs(positive_validation_fasta_path.parent, exist_ok=True)
+    os.makedirs(non_kunitz_validation_fasta_path.parent, exist_ok=True)
+    os.makedirs(swissprot_fasta_path.parent, exist_ok=True) # For swissprot_database dir
+
+    print("--- Preparing Validation Datasets ---")
+
+    # 1. Prepare Positive Validation Set
+    print("\n1. Preparing Positive Validation Set (Kunitz domains not in training data)...")
+    if not check_stockholm(seed_alignment_path):
+        print("ERROR: Training seed alignment is missing or invalid. Cannot prepare positive validation set.", file=sys.stderr)
+        sys.exit(1)
+    training_ids = parse_stockholm_ids(seed_alignment_path)
+    print(f"Found {len(training_ids)} training sequence IDs.")
+
+    # Pfam full alignment for Kunitz (PF00014.full.gz)
+    pfam_full_alignment_gz = positive_validation_fasta_path.parent / "PF00014.full.gz"
+    if not pfam_full_alignment_gz.exists() or pfam_full_alignment_gz.stat().st_size == 0:
+        print(f"ERROR: Pfam Kunitz full alignment '{pfam_full_alignment_gz}' not found or empty.", file=sys.stderr)
+        print(f"Please download 'PF00014.full.gz' from Pfam (https://pfam.xfam.org/family/PF00014) and place it in '{pfam_full_alignment_gz.parent}'.", file=sys.stderr)
+        sys.exit(1)
+
+    extract_pfam_kunitz_sequences(pfam_full_alignment_gz, training_ids, positive_validation_fasta_path)
+    if not positive_validation_fasta_path.exists() or positive_validation_fasta_path.stat().st_size == 0:
+        print("ERROR: Positive validation FASTA was not generated correctly.", file=sys.stderr)
+        sys.exit(1)
+
+
+    # 2. Prepare Negative Validation Set (Conditional based on strategy)
+    print("\n2. Preparing Negative Validation Set...")
+    negative_set_strategy = CONFIG['negative_set_strategy']
+
+    if negative_set_strategy == 'random_swissprot':
+        sample_non_kunitz_from_swissprot(swissprot_fasta_path, CONFIG['num_negative_samples'], non_kunitz_validation_fasta_path)
+    elif negative_set_strategy == 'structurally_similar':
+        # Need directories for PDBs if using structurally similar negatives
+        raw_pdb_dir = get_full_path(CONFIG['data_dir']) / "raw_pdb_files_neg" # Separate dir for negatives
+        chain_dir = raw_pdb_dir / "chains_for_neg_validation"
+        prepare_structurally_similar_negative_set(
+            CONFIG['structurally_similar_negative_pdb_ids'],
+            CONFIG['structurally_similar_negative_pdb_chains'],
+            non_kunitz_validation_fasta_path,
+            raw_pdb_dir,
+            chain_dir
+        )
+    
+    if not non_kunitz_validation_fasta_path.exists() or non_kunitz_validation_fasta_path.stat().st_size == 0:
+        print("ERROR: Negative validation FASTA was not generated correctly.", file=sys.stderr)
+        sys.exit(1)
+
+
+    # 3. Create Combined Validation Labels File
+    print("\n3. Creating Combined Validation Labels File...")
+    create_validation_labels(positive_validation_fasta_path, non_kunitz_validation_fasta_path, validation_labels_txt_path)
+    if not validation_labels_txt_path.exists() or validation_labels_txt_path.stat().st_size == 0:
+        print("ERROR: Validation labels file was not generated correctly.", file=sys.stderr)
+        sys.exit(1)
+
+    print("\n✅ Data preparation completed successfully!")
