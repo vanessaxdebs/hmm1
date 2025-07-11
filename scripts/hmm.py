@@ -7,7 +7,7 @@ structure-informed Profile Hidden Markov Model (HMM) for the Kunitz domain.
 import os
 import sys
 import subprocess
-import gzip
+import gzip # Added for check_stockholm/fasta if they handle gzipped files
 import json
 from pathlib import Path
 from datetime import datetime
@@ -38,11 +38,9 @@ def load_config(config_file: Path = None) -> dict:
         print(f"ERROR: Config file not found at {config_file}", file=sys.stderr)
         sys.exit(1)
 
-    # IMPORTANT: 'output_dir' is NOT in config.yaml directly. It's derived from 'results_dir'.
-    # So, 'results_dir' should be in required_fields, not 'output_dir'.
     required_fields = {
         'data_dir': str,
-        'results_dir': str, # Corrected: Expect results_dir, not output_dir
+        'results_dir': str,
         'scripts_dir': str,
         'config_dir': str,
         'seed_alignment': str,
@@ -52,8 +50,8 @@ def load_config(config_file: Path = None) -> dict:
         'swissprot_fasta': str,
         'e_value_cutoff': float,
         'negative_set_strategy': str,
-        'clustering_identity_threshold': float, # Added for consistency
-        'clustering_length_difference_cutoff': float, # Added for consistency
+        'clustering_identity_threshold': float,
+        'clustering_length_difference_cutoff': float,
     }
 
     try:
@@ -83,7 +81,6 @@ def load_config(config_file: Path = None) -> dict:
             sys.exit(1)
 
         # Convert path strings to Path objects for easier handling AFTER all validation
-        # This is done here to ensure all config values are validated before path conversion
         config['data_dir'] = Path(config['data_dir'])
         config['results_dir'] = Path(config['results_dir'])
         config['scripts_dir'] = Path(config['scripts_dir'])
@@ -104,7 +101,7 @@ def get_full_path(relative_path: Path, project_root: Path) -> Path:
     """Converts a relative Path object to an absolute Path relative to project root."""
     return project_root / relative_path
 
-# --- File Check Helper Functions (Copied from data_prep.py) ---
+# --- File Check Helper Functions (Copied from data_prep.py and now needed here) ---
 def check_stockholm(file_path: Path) -> bool:
     """Checks if a Stockholm file exists and is not empty."""
     if not file_path.exists():
