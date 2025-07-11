@@ -104,6 +104,39 @@ def get_full_path(relative_path: Path, project_root: Path) -> Path:
     """Converts a relative Path object to an absolute Path relative to project root."""
     return project_root / relative_path
 
+# --- File Check Helper Functions (Copied from data_prep.py) ---
+def check_stockholm(file_path: Path) -> bool:
+    """Checks if a Stockholm file exists and is not empty."""
+    if not file_path.exists():
+        print(f"ERROR: Stockholm file '{file_path}' not found.", file=sys.stderr)
+        return False
+    if file_path.stat().st_size == 0:
+        print(f"ERROR: Stockholm file '{file_path}' is empty.", file=sys.stderr)
+        return False
+    return True
+
+def check_fasta(file_path: Path) -> bool:
+    """Checks if a FASTA file exists and is not empty."""
+    if not file_path.exists():
+        print(f"ERROR: FASTA file '{file_path}' not found.", file=sys.stderr)
+        return False
+    if file_path.stat().st_size == 0:
+        print(f"ERROR: FASTA file '{file_path}' is empty.", file=sys.stderr)
+        return False
+    return True
+
+def check_label_txt(file_path: Path) -> bool:
+    """Checks if a label file exists and is not empty."""
+    if not file_path.exists():
+        print(f"ERROR: Label file '{file_path}' not found.", file=sys.stderr)
+        return False
+    if file_path.stat().st_size == 0:
+        print(f"ERROR: Label file '{file_path}' is empty.", file=sys.stderr)
+        return False
+    return True
+# --- End of File Check Helper Functions ---
+
+
 def run_hmmbuild(seed_alignment_file: Path, output_hmm_file: Path) -> None:
     """Builds an HMM from a Stockholm alignment file."""
     print(f"Building HMM: hmmbuild {output_hmm_file} {seed_alignment_file}")
