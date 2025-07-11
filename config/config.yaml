@@ -25,17 +25,17 @@ e_value_cutoff: 0.001 # E-value threshold for hmmsearch hits
 
 # --- Negative Set Generation Strategy ---
 # Choose between 'random_swissprot' or 'structurally_similar'
-# Reverting to 'random_swissprot' for easier large-scale automation of negatives.
+# Reverting to 'random_swissprot' for fully automated, large-scale negative set generation.
 negative_set_strategy: 'random_swissprot' 
 
 # Parameters for 'random_swissprot' strategy (if used)
 # Significantly increased number of negative samples for a more robust test.
-num_negative_samples: 500000 # Increased to 500,000 (or even 1,000,000 if needed)
+num_negative_samples: 1000000 # Increased to 1,000,000 for a very large and diverse negative set
 
 # Parameters for 'structurally_similar' strategy (if negative_set_strategy is set to this)
-# Keeping this section for reference, but it won't be used with 'random_swissprot' strategy.
-# Manual curation or advanced structural search tools would be needed for a truly large
-# and diverse set of "hard" structurally similar negatives.
+# This section is kept for reference but will not be actively used with 'random_swissprot' strategy.
+# For truly "hard" structurally similar negatives, manual curation or advanced structural
+# search tools (outside the scope of this script) would be required.
 structurally_similar_negative_pdb_ids:
   - "1AON" # Cyclotide (plant defense peptide)
   - "1BQC" # Defensin (antimicrobial peptide)
@@ -48,5 +48,5 @@ structurally_similar_negative_pdb_chains:
 # --- Clustering Parameters ---
 # These parameters are used by data_prep.py for redundancy reduction (CD-HIT).
 # Lowering the identity threshold makes the sets more diverse (less redundant).
-clustering_identity_threshold: 0.70 # More stringent clustering (e.g., 70% identity)
+clustering_identity_threshold: 0.40 # More stringent clustering (e.g., 40% identity) for positive set
 clustering_length_difference_cutoff: 0.90 # Length difference cutoff (e.g., 90% length overlap)
