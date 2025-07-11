@@ -13,6 +13,11 @@ from typing import Dict, Set, Tuple
 import yaml
 from datetime import datetime
 from Bio import SeqIO
+import yaml
+from datetime import datetime
+from Bio import SeqIO
+import json # <--- Make sure this is here or with other imports
+from visualize_metrics import plot_confusion_bar, plot_metrics_summary
 
 # ---------- Biopython-based utilities ----------
 
@@ -344,7 +349,17 @@ if __name__ == "__main__":
 
     print("\n--- 4. Evaluating Model Performance ---")
     metrics = evaluate_performance(all_predicted_hits_in_validation, true_labels)
-
+    import json # This import should ideally be at the top of the file
+    confusion_counts_path = output_dir / "confusion_matrix_counts.json"
+    confusion_counts = {
+        "TP": metrics["TP"],
+        "FP": metrics["FP"],
+        "FN": metrics["FN"],
+        "TN": metrics["TN"]
+    }
+    with open(confusion_counts_path, "w") as f:
+        json.dump(confusion_counts, f, indent=4)
+    print(f"Confusion matrix counts saved to {confusion_counts_path}")
     print("\n--- Combined Validation Performance ---")
     with open(output_dir / "validation_metrics.txt", "w") as f_metrics:
         for key, val in metrics.items():
