@@ -179,15 +179,17 @@ def run_cdhit(input_fasta: Path, output_fasta: Path, identity_threshold: float, 
     # -n 3 for thresholds > 0.5
     # -n 2 for thresholds > 0.4
     # -n 1 for thresholds > 0.3
-    if identity_threshold > 0.7:
+    # Note: CD-HIT's -c parameter is inclusive for the threshold,
+    # so we need to adjust the logic to match its behavior.
+    if identity_threshold >= 0.7:
         word_size = 5
-    elif identity_threshold > 0.6:
+    elif identity_threshold >= 0.6:
         word_size = 4
-    elif identity_threshold > 0.5:
+    elif identity_threshold >= 0.5:
         word_size = 3
-    elif identity_threshold > 0.4:
+    elif identity_threshold >= 0.4: # This is the crucial fix for 0.40
         word_size = 2
-    elif identity_threshold > 0.3:
+    elif identity_threshold >= 0.3:
         word_size = 1
     else:
         # For very low thresholds, CD-HIT might struggle or require specific tuning.
