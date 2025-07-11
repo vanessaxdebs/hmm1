@@ -16,6 +16,9 @@ from Bio.PDB import PDBList # For downloading PDBs for structurally similar nega
 from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
 
+# --- Configuration ---
+MIN_NEGATIVE_SAMPLES_THRESHOLD = 500 # Define a minimum acceptable number of negative samples
+
 # --- Helper Functions (from your existing scripts) ---
 
 def load_config(config_file: Path = None) -> dict:
@@ -169,6 +172,30 @@ def run_cdhit(input_fasta: Path, output_fasta: Path, identity_threshold: float, 
     """
     print(f"Running CD-HIT on {input_fasta.name} at {identity_threshold*100}% identity...")
     
+    # Determine word size based on identity threshold
+    # CD-HIT manual recommendations:
+    # -n 5 for thresholds > 0.7
+    # -n 4 for thresholds > 0.6
+    # -n 3 for thresholds > 0.5
+    # -n 2 for thresholds > 0.4
+    # -n 1 for thresholds > 0.3
+    if identity_threshold > 0.7:
+        word_size = 5
+    elif identity_threshold > 0.6:
+        word_size = 4
+    elif identity_threshold > 0.5:
+        word_size = 3
+    elif identity_threshold > 0.4:
+        word_size = 2
+    elif identity_threshold > 0.3:
+        word_size = 1
+    else:
+        # For very low thresholds, CD-HIT might struggle or require specific tuning.
+        # We'll use 1 as the lowest possible, but warn the user.
+        word_size = 1
+        print(f"WARNING: Very low identity threshold ({identity_threshold*100}%) detected. Using word size -n 1. CD-HIT might still struggle or produce unexpected results.", file=sys.stderr)
+
+
     # CD-HIT output files
     clstr_file = output_fasta.with_suffix('.clstr')
 
@@ -180,6 +207,7 @@ def run_cdhit(input_fasta: Path, output_fasta: Path, identity_threshold: float, 
     # -g 1: greedy clustering (default)
     # -T 0: use all available threads (0 means auto)
     # -M 0: use all available memory (0 means auto)
+    # -n word_size: word size for initial clustering
     cmd = [
         "cd-hit",
         "-i", str(input_fasta),
@@ -188,7 +216,8 @@ def run_cdhit(input_fasta: Path, output_fasta: Path, identity_threshold: float, 
         "-aS", str(length_diff_cutoff),
         "-g", "1",
         "-T", "0",
-        "-M", "0"
+        "-M", "0",
+        "-n", str(word_size) # Dynamically set word size
     ]
 
     try:
@@ -447,14 +476,15 @@ if __name__ == "__main__":
     # 2. Prepare Negative Validation Set (Conditional based on strategy)
     print("\n2. Preparing Negative Validation Set...")
     negative_set_strategy = CONFIG['negative_set_strategy']
+    negative_samples_count = 0
 
     if negative_set_strategy == 'random_swissprot':
-        sample_non_kunitz_from_swissprot(swissprot_fasta_path, CONFIG['num_negative_samples'], non_kunitz_validation_fasta_path)
+        negative_samples_count = sample_non_kunitz_from_swissprot(swissprot_fasta_path, CONFIG['num_negative_samples'], non_kunitz_validation_fasta_path)
     elif negative_set_strategy == 'structurally_similar':
         # Need directories for PDBs if using structurally similar negatives
         raw_pdb_dir = get_full_path(CONFIG['data_dir']) / "raw_pdb_files_neg" # Separate dir for negatives
         chain_dir = raw_pdb_dir / "chains_for_neg_validation"
-        prepare_structurally_similar_negative_set(
+        negative_samples_count = prepare_structurally_similar_negative_set(
             CONFIG['structurally_similar_negative_pdb_ids'],
             CONFIG['structurally_similar_negative_pdb_chains'],
             non_kunitz_validation_fasta_path,
@@ -466,6 +496,11 @@ if __name__ == "__main__":
     if not non_kunitz_validation_fasta_path.exists() or non_kunitz_validation_fasta_path.stat().st_size == 0:
         print("ERROR: Negative validation FASTA was not generated correctly.", file=sys.stderr)
         sys.exit(1)
+
+    # Add a warning if the generated negative set is too small
+    if negative_samples_count < MIN_NEGATIVE_SAMPLES_THRESHOLD:
+        print(f"WARNING: The generated negative validation set contains only {negative_samples_count} sequences, which is less than the recommended minimum of {MIN_NEGATIVE_SAMPLES_THRESHOLD}.", file=sys.stderr)
+        print(f"Consider increasing the number of PDB IDs in 'structurally_similar_negative_pdb_ids' or switching to 'random_swissprot' strategy in config.yaml for a larger negative set.", file=sys.stderr)
 
 
     # 3. Create Combined Validation Labels File
