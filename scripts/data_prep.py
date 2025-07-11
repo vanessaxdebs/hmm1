@@ -20,10 +20,12 @@ from Bio.Seq import Seq
 
 def load_config(config_file: Path = None) -> dict:
     """Loads configuration from a YAML file."""
+    # Define script_dir and project_root_guess unconditionally at the start
+    script_dir = Path(__file__).resolve().parent
+    project_root_guess = script_dir.parent
+
     if config_file is None:
         # Assume config.yaml is in a 'config' directory one level up from 'scripts'
-        script_dir = Path(__file__).resolve().parent
-        project_root_guess = script_dir.parent
         config_file = project_root_guess / "config" / "config.yaml"
 
     print(f"DEBUG: script_dir (parent of data_prep.py): {script_dir}")
