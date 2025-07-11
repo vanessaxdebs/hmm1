@@ -21,10 +21,12 @@ import matplotlib.pyplot as plt # Import matplotlib for plotting
 
 def load_config(config_file: Path = None) -> dict:
     """Loads configuration from a YAML file."""
+    # Define script_dir and project_root_guess unconditionally at the start
+    script_dir = Path(__file__).resolve().parent
+    project_root_guess = script_dir.parent
+
     if config_file is None:
         # Assume config.yaml is in a 'config' directory one level up from 'scripts'
-        script_dir = Path(__file__).resolve().parent
-        project_root_guess = script_dir.parent
         config_file = project_root_guess / "config" / "config.yaml"
 
     print(f"DEBUG: script_dir (parent of hmm.py): {script_dir}")
@@ -64,17 +66,6 @@ def load_config(config_file: Path = None) -> dict:
                 print(f"Configuration error in {config_file}: Missing or invalid required config field: {field}. Expected type: {expected_type.__name__}", file=sys.stderr)
                 sys.exit(1)
 
-        # Convert path strings to Path objects for easier handling
-        config['data_dir'] = Path(config['data_dir'])
-        config['results_dir'] = Path(config['results_dir'])
-        config['scripts_dir'] = Path(config['scripts_dir'])
-        config['config_dir'] = Path(config['config_dir'])
-        config['seed_alignment'] = Path(config['seed_alignment'])
-        config['positive_validation_fasta'] = Path(config['positive_validation_fasta'])
-        config['non_kunitz_validation_fasta'] = Path(config['non_kunitz_validation_fasta'])
-        config['validation_labels_txt'] = Path(config['validation_labels_txt'])
-        config['swissprot_fasta'] = Path(config['swissprot_fasta'])
-
         # Validate strategy-specific fields (copied from data_prep.py for consistency)
         if config['negative_set_strategy'] == 'random_swissprot':
             if 'num_negative_samples' not in config or not isinstance(config['num_negative_samples'], int):
@@ -90,6 +81,18 @@ def load_config(config_file: Path = None) -> dict:
         else:
             print(f"ERROR: Unknown negative_set_strategy: {config['negative_set_strategy']}", file=sys.stderr)
             sys.exit(1)
+
+        # Convert path strings to Path objects for easier handling AFTER all validation
+        # This is done here to ensure all config values are validated before path conversion
+        config['data_dir'] = Path(config['data_dir'])
+        config['results_dir'] = Path(config['results_dir'])
+        config['scripts_dir'] = Path(config['scripts_dir'])
+        config['config_dir'] = Path(config['config_dir'])
+        config['seed_alignment'] = Path(config['seed_alignment'])
+        config['positive_validation_fasta'] = Path(config['positive_validation_fasta'])
+        config['non_kunitz_validation_fasta'] = Path(config['non_kunitz_validation_fasta'])
+        config['validation_labels_txt'] = Path(config['validation_labels_txt'])
+        config['swissprot_fasta'] = Path(config['swissprot_fasta'])
 
         return config
 
