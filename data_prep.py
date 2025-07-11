@@ -17,9 +17,17 @@ import yaml
 def find_config() -> Path:
     """Finds the config.yaml file relative to the script's location."""
     script_dir = Path(__file__).parent
-    config_path = script_dir.parent / "config" / "config.yaml"
+    print(f"DEBUG: script_dir (parent of data_prep.py): {script_dir}", file=sys.stderr) # ADD THIS
+    project_root_guess = script_dir.parent
+    print(f"DEBUG: project_root_guess: {project_root_guess}", file=sys.stderr) # ADD THIS
+    config_path = project_root_guess / "config" / "config.yaml"
+    print(f"DEBUG: config_path that script is looking for: {config_path}", file=sys.stderr) # ADD THIS
+
     if config_path.exists():
+        print(f"DEBUG: config_path.exists() returned TRUE: {config_path}", file=sys.stderr) # ADD THIS
         return config_path.resolve()
+    else: # ADD THIS
+        print(f"DEBUG: config_path.exists() returned FALSE for: {config_path}", file=sys.stderr) # ADD THIS
     raise FileNotFoundError("config.yaml not found! Ensure it's in 'config/' relative to the project root.")
 
 def load_config() -> dict:
