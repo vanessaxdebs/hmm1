@@ -25,24 +25,29 @@ e_value_cutoff: 0.001 # E-value threshold for hmmsearch hits
 
 # --- Negative Set Generation Strategy ---
 # Choose between 'random_swissprot' or 'structurally_similar'
-negative_set_strategy: 'random_swissprot' # Default to random sampling from SwissProt
+# Set to 'structurally_similar' for a more challenging validation
+negative_set_strategy: 'structurally_similar' 
 
-# Parameters for 'random_swissprot' strategy
-num_negative_samples: 50000 # Number of non-Kunitz sequences to sample from SwissProt
+# Parameters for 'random_swissprot' strategy (if used)
+num_negative_samples: 50000 
 
 # Parameters for 'structurally_similar' strategy (if negative_set_strategy is set to this)
 # IMPORTANT: These are *example* PDB IDs for demonstration. In a real project,
 # you would meticulously curate these to be genuinely structurally similar
 # but functionally unrelated to Kunitz, and NOT Kunitz themselves.
+# These examples are small, disulfide-rich peptides/proteins, which might be
+# structurally similar to Kunitz in a very general sense.
 structurally_similar_negative_pdb_ids:
-  - "1AON" # Example: Cyclotide (small, disulfide-rich, plant peptide)
-  - "1BQC" # Example: Defensin (small, disulfide-rich, antimicrobial peptide)
-  - "1G6W" # Example: Omega-agatoxin (small, neurotoxin, disulfide-rich)
-  - "1M04" # Example: Conotoxin (small, neurotoxin, disulfide-rich)
-  - "2M4Y" # Example: Human beta-defensin 2
-  - "1W27" # Example: Scorpion toxin
-  - "1J24" # Example: Snake venom neurotoxin
-  - "1K25" # Example: Plant defensin
+  - "1AON" # Cyclotide (plant defense peptide)
+  - "1BQC" # Defensin (antimicrobial peptide)
+  - "1G6W" # Omega-agatoxin (neurotoxin)
+  - "1M04" # Conotoxin (neurotoxin)
+  - "2M4Y" # Human beta-defensin 2
+  - "1W27" # Scorpion toxin
+  - "1J24" # Snake venom neurotoxin
+  - "1K25" # Plant defensin
+  - "1B64" # Alpha-bungarotoxin (neurotoxin)
+  - "1POC" # Protease inhibitor from potato
 structurally_similar_negative_pdb_chains:
   1AON: "A"
   1BQC: "A"
@@ -52,11 +57,12 @@ structurally_similar_negative_pdb_chains:
   1W27: "A"
   1J24: "A"
   1K25: "A"
+  1B64: "A"
+  1POC: "A"
 
 # --- Clustering Parameters ---
-# These parameters would be used by data_prep.py (or other data curation scripts)
-# for redundancy reduction (e.g., using CD-HIT) on sequence sets.
-# For example, to cluster the positive validation set derived from PF00014.full.gz
-# or the sequences extracted for the 'structurally_similar' negative set.
-clustering_identity_threshold: 0.90 # Sequence identity threshold (e.g., 0.9 for 90%)
-clustering_length_difference_cutoff: 0.90 # Length difference cutoff (e.g., 0.9 for 90% length overlap)
+# These parameters are used by data_prep.py for redundancy reduction (CD-HIT).
+# Lowering the identity threshold makes the sets more diverse (less redundant).
+clustering_identity_threshold: 0.70 # More stringent clustering (e.g., 70% identity)
+clustering_length_difference_cutoff: 0.90 # Length difference cutoff (e.g., 90% length overlap)
+
