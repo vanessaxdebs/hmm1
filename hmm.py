@@ -353,6 +353,36 @@ if __name__ == "__main__":
             f_metrics.write(line + "\n")
     print(f"Metrics saved to {output_dir / 'validation_metrics.txt'}")
 
+      # Save raw confusion matrix counts to a JSON file for plotting
+    import json # Ensure json is imported at the top of the file, or here if not already
+    confusion_counts_path = output_dir / "confusion_matrix_counts.json"
+    confusion_counts = {
+        "TP": metrics["TP"],
+        "FP": metrics["FP"],
+        "FN": metrics["FN"],
+        "TN": metrics["TN"]
+    }
+    with open(confusion_counts_path, "w") as f:
+        json.dump(confusion_counts, f, indent=4)
+    print(f"Confusion matrix counts saved to {confusion_counts_path}")
+
+    # --- The calls to plot_confusion_bar and plot_metrics_summary should come AFTER these two blocks ---
+    print("\n--- Generating Metric Visualizations ---")
+    
+    # Define paths for the new plots
+    confusion_bar_plot_path = output_dir / "confusion_matrix_bar.png"
+    metrics_summary_plot_path = output_dir / "performance_metrics_summary.png"
+
+    try:
+        # Call the functions from visualize_metrics.py
+        plot_confusion_bar(metrics, confusion_bar_plot_path)
+        print(f"Confusion matrix bar plot saved to {confusion_bar_plot_path}")
+        
+        plot_metrics_summary(metrics, metrics_summary_plot_path)
+        print(f"Performance metrics summary plot saved to {metrics_summary_plot_path}")
+    except Exception as e:
+        print(f"WARNING: Could not generate additional metric plots: {e}", file=sys.stderr)
+
     print("\n--- 5. Analyzing False Positives and False Negatives ---")
     # Identify False Positives and False Negatives based on the combined set
     false_positives = []
