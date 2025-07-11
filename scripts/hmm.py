@@ -4,7 +4,7 @@ Kunitz-type Protease Inhibitor Domain - HMM Profile Pipeline (Biopython version)
 Compatible with hmmologs project standards.
 Includes independent positive and negative validation.
 """
-
+import matplotlib.pyplot as plt
 import os
 import sys
 import subprocess
@@ -244,7 +244,39 @@ def evaluate_performance(predicted_hits: Set[str], all_true_labels: Dict[str, st
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
 
     return dict(TP=tp, FP=fp, FN=fn, TN=tn, accuracy=acc, precision=prec, recall=rec, f1=f1, specificity=specificity)
+def plot_confusion_bar(metrics, output_path):
+    """Plot confusion matrix as a bar chart."""
+    labels = ['TP', 'FP', 'FN', 'TN']
+    # Ensure values are integers for the bar chart
+    values = [int(metrics['TP']), int(metrics['FP']), int(metrics['FN']), int(metrics['TN'])]
+    plt.figure(figsize=(6,4))
+    bars = plt.bar(labels, values, color=['green', 'red', 'orange', 'blue'])
+    plt.title("Confusion Matrix Counts") # Changed title to reflect counts
+    plt.ylabel("Count")
+    plt.xlabel("Prediction Outcome")
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, yval + 0.1, int(yval), ha='center', va='bottom') # Centered text
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
 
+def plot_metrics_summary(metrics, output_path):
+    """Plot precision, recall, accuracy, F1 as a bar chart."""
+    labels = ['Accuracy', 'Precision', 'Recall', 'F1']
+    values = [metrics['accuracy'], metrics['precision'], metrics['recall'], metrics['f1']]
+    plt.figure(figsize=(6,4))
+    bars = plt.bar(labels, values, color=['skyblue', 'lightgreen', 'gold', 'violet'])
+    plt.ylim(0,1.05) # Slightly extend y-limit for text
+    plt.title("Performance Metrics")
+    plt.ylabel("Score")
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, yval + 0.02, f"{yval:.2f}", ha='center', va='bottom') # Centered text
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    
 def run_hmmlogo(hmm_file: Path, output_dir: Path):
     """Generates an HMM logo using hmmlogo."""
     logo_file = output_dir / "hmm_logo.png"
@@ -320,7 +352,17 @@ if __name__ == "__main__":
 
     print("\n--- 4. Evaluating Model Performance ---")
     metrics = evaluate_performance(final_predicted_hits_for_eval, true_labels)
+    print("\n--- Generating Metric Visualizations ---")
+confusion_bar_plot_path = output_dir / "confusion_matrix_bar.png"
+metrics_summary_plot_path = output_dir / "performance_metrics_summary.png"
 
+try:
+    plot_confusion_bar(metrics, confusion_bar_plot_path)
+    print(f"Confusion matrix bar plot saved to {confusion_bar_plot_path}")
+    plot_metrics_summary(metrics, metrics_summary_plot_path)
+    print(f"Performance metrics summary plot saved to {metrics_summary_plot_path}")
+except Exception as e:
+    print(f"WARNING: Could not generate additional metric plots: {e}", file=sys.stderr)
     print("\n--- Combined Validation Performance ---")
     with open(output_dir / "validation_metrics.txt", "w") as f_metrics:
         for key, val in metrics.items():
